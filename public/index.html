@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SocialSnap - Download Posts from Any Platform</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        .gradient-bg {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+        .platform-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 20px rgba(0,0,0,0.1);
+        }
+        .download-btn {
+            transition: all 0.3s ease;
+        }
+        .download-btn:hover {
+            transform: scale(1.05);
+        }
+        .input-glow:focus {
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.3);
+        }
+    </style>
+  <script type="module" crossorigin src="/assets/index-CMsVvTok.js"></script>
+  <link rel="stylesheet" crossorigin href="/assets/index-B5x6P873.css">
+</head>
+<body class="font-sans antialiased text-gray-800">
+    <div id="root"></div>
+
+    <script>
+        async function downloadContent(type) {
+            const urlInput = document.getElementById('urlInput');
+            const status = document.getElementById('status');
+            const url = urlInput.value.trim();
+
+            if (!url) {
+                alert('Please paste a valid social media URL first!');
+                return;
+            }
+
+            try {
+                status.classList.remove('hidden');
+                
+                const response = await fetch('/api/download', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ url, type })
+                });
+
+                const data = await response.json();
+
+                if (data.success) {
+                    // Create download link
+                    const a = document.createElement('a');
+                    a.href = data.downloadUrl;
+                    a.download = data.filename;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    
+                    alert('Download started!');
+                } else {
+                    alert('Error: ' + (data.message || 'Failed to download'));
+                }
+            } catch (error) {
+                console.error('Error:', error);
+                alert('An error occurred while processing your request');
+            } finally {
+                status.classList.add('hidden');
+            }
+        }
+    </script>
+</body>
+</html> 

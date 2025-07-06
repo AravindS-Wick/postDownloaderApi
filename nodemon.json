@@ -1,0 +1,10 @@
+{
+  "ignore": [
+    "downloads/*",
+    "*.json",
+    "*.log"
+  ],
+  "delay": "2500",
+  "watch": ["src"],
+  "ext": "js"
+} 
