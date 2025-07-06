@@ -1,0 +1,16 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: social-downloader-monitor
+  namespace: social-downloader
+  labels:
+    app: social-downloader-api
+spec:
+  selector:
+    matchLabels:
+      app: social-downloader-api
+  endpoints:
+  - port: http
+    path: /metrics
+    interval: 30s
+    scrapeTimeout: 10s
