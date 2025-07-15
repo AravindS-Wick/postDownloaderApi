@@ -12,7 +12,7 @@ export interface UserProfile {
     id: string;
     email: string;
     name: string;
-    platforms: SocialPlatform[];
+    connectedPlatforms: SocialPlatform[];
 }
 
 export interface PlatformAuthConfig {
@@ -39,5 +39,5 @@ export interface AuthConfig {
 
 export interface JwtPayload {
     userId: string;
-    email: string;
+    email?: string;
 } 

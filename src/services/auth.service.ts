@@ -99,7 +99,7 @@ export class AuthService {
             id: userId,
             email: 'user@example.com',
             name: 'Test User',
-            platforms: []
+            connectedPlatforms: []
         };
     }
 }
