@@ -9,54 +9,57 @@ import path from 'path';
 import fs from 'fs';
 import { exec } from 'child_process';
 import util from 'util';
-import express from 'express';
+import crypto from 'crypto';
 import { authRoutes } from './routes/auth.routes.js';
 import { authConfig } from './config/auth.config.js';
-import dotenv from 'dotenv';
+import { appConfig, isProduction } from './config/app.config.js';
 import jwt from '@fastify/jwt';
 import { fileURLToPath } from 'url';
 import fastifyStatic from '@fastify/static';
+import { temporaryFile, temporaryDirectory } from 'tempy';
 
-dotenv.config();
+// Import plugins
+import rateLimitPlugin from './plugins/rate-limit.js';
+import securityPlugin from './plugins/security.js';
+import healthPlugin from './plugins/health.js';
+import { errorHandler } from './utils/error-handler.js';
 
 const execAsync = util.promisify(exec);
 const app = fastify({
     logger: {
-        level: 'info',
-        transport: {
-            target: 'pino-pretty'
+        level: appConfig.logLevel,
+        transport: isProduction ? undefined : {
+            target: 'pino-pretty',
+            options: {
+                colorize: true,
+                translateTime: 'HH:MM:ss Z',
+                ignore: 'pid,hostname'
+            }
         }
-    }
+    },
+    trustProxy: appConfig.trustProxy,
+    requestIdHeader: 'x-request-id',
+    requestIdLogLabel: 'requestId',
+    genReqId: () => crypto.randomUUID()
 });
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Add request logging
-app.addHook('onRequest', (request: FastifyRequest, reply: FastifyReply, done: HookHandlerDoneFunction) => {
-    console.log(`[${new Date().toISOString()}] ${request.method} ${request.url}`);
-    done();
-});
+// Register error handler
+app.setErrorHandler(errorHandler);
 
-// Add response logging
-app.addHook('onResponse', (request: FastifyRequest, reply: FastifyReply, done: HookHandlerDoneFunction) => {
-    console.log(`[${new Date().toISOString()}] ${request.method} ${request.url} - ${reply.statusCode}`);
-    done();
-});
+// Register plugins
+app.register(securityPlugin);
+app.register(rateLimitPlugin);
+app.register(healthPlugin);
 
-// Enable CORS with more specific options
+// Enable CORS with production-ready options
 app.register(cors, {
-    origin: [
-        'http://localhost:2000',
-        'http://localhost:8081',
-        'http://localhost:19006', // Add web client origin
-        'exp://localhost:2100',
-        'exp://127.0.0.1:2100',
-        'exp://127.0.0.1:8081'
-    ],
+    origin: appConfig.corsOrigins,
     methods: ['GET', 'POST', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'Content-Disposition', 'Accept', 'Origin', 'X-Requested-With'],
-    exposedHeaders: ['Content-Disposition', 'Content-Length', 'Content-Type'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'Content-Disposition', 'Accept', 'Origin', 'X-Requested-With', 'X-Request-ID'],
+    exposedHeaders: ['Content-Disposition', 'Content-Length', 'Content-Type', 'X-Request-ID'],
     credentials: true,
     preflightContinue: false,
     optionsSuccessStatus: 204,
@@ -71,31 +74,79 @@ app.register(jwt, {
     }
 });
 
-// Swagger documentation
-app.register(swagger, {
-    swagger: {
-        info: {
-            title: 'Social Media Downloader API',
-            description: 'API for downloading content from various social media platforms',
-            version: '1.0.0'
+// Swagger documentation (only in development)
+if (appConfig.enableSwagger) {
+    app.register(swagger, {
+        swagger: {
+            info: {
+                title: 'Social Media Downloader API',
+                description: 'API for downloading content from various social media platforms',
+                version: '1.0.0'
+            },
+            host: `localhost:${appConfig.port}`,
+            schemes: ['http'],
+            consumes: ['application/json'],
+            produces: ['application/json']
         }
-    }
-});
+    });
 
-app.register(swaggerUi, {
-    routePrefix: '/documentation'
-});
-
-// Create downloads directory if it doesn't exist
-const downloadsDir = path.join(__dirname, '..', 'downloads');
-if (!fs.existsSync(downloadsDir)) {
-    fs.mkdirSync(downloadsDir);
+    app.register(swaggerUi, {
+        routePrefix: '/documentation',
+        uiConfig: {
+            docExpansion: 'list',
+            deepLinking: false
+        }
+    });
 }
 
-// Serve static files from the downloads directory with proper headers
+// Create temporary downloads directory
+const tempDownloadsDir = temporaryDirectory();
+console.log(`Temporary downloads directory: ${tempDownloadsDir}`);
+
+// Temporary file management constants
+const TEMP_FILE_CLEANUP_INTERVAL = 15 * 60 * 1000; // 15 minutes
+const TEMP_FILE_MAX_AGE = 15 * 60 * 1000; // 15 minutes
+
+// Temporary file management
+interface TempFileInfo {
+    filePath: string;
+    filename: string;
+    createdAt: number;
+    platform: string;
+}
+
+const tempFiles = new Map<string, TempFileInfo>();
+
+// Cleanup function for temporary files
+function cleanupTempFiles() {
+    const now = Date.now();
+    const filesToDelete: string[] = [];
+    
+    for (const [fileId, fileInfo] of tempFiles.entries()) {
+        if (now - fileInfo.createdAt > TEMP_FILE_MAX_AGE) {
+            try {
+                if (fs.existsSync(fileInfo.filePath)) {
+                    fs.unlinkSync(fileInfo.filePath);
+                    console.log(`Cleaned up temporary file: ${fileInfo.filename}`);
+                }
+                filesToDelete.push(fileId);
+            } catch (error) {
+                console.error(`Error cleaning up file ${fileInfo.filename}:`, error);
+            }
+        }
+    }
+    
+    // Remove from tracking map
+    filesToDelete.forEach(fileId => tempFiles.delete(fileId));
+}
+
+// Start cleanup interval
+setInterval(cleanupTempFiles, TEMP_FILE_CLEANUP_INTERVAL);
+
+// Serve temporary files
 app.register(fastifyStatic, {
-    root: downloadsDir,
-    prefix: '/downloads/',
+    root: tempDownloadsDir,
+    prefix: '/temp/',
     setHeaders: (res, filePath) => {
         res.setHeader('Content-Disposition', `attachment; filename="${path.basename(filePath)}"`);
         res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition');
@@ -111,7 +162,15 @@ app.register(authRoutes, { prefix: '/api/auth' });
 
 // Define types for download functions
 type DownloadType = 'video' | 'audio';
-type DownloadResult = {
+
+// Define request body type
+interface DownloadRequest {
+    url: string;
+    type: DownloadType;
+}
+
+// Define response type
+interface DownloadResult {
     success: boolean;
     downloadUrl: string;
     filename: string;
@@ -121,31 +180,119 @@ type DownloadResult = {
     hashtags?: string[];
     length?: string;
     ageRestriction?: boolean;
-};
-
-// Define request body type
-interface DownloadRequest {
-    url: string;
-    type: DownloadType;
 }
 
-// Define error types
-interface DownloadError extends Error {
-    filename?: string;
-}
-
-function isDownloadError(error: unknown): error is DownloadError {
-    return error instanceof Error && 'filename' in error;
-}
-
-// Helper function to generate unique filename
-const generateFilename = (platform: string, type: string, extension: string): string => {
-    return `${platform}-${type}-${Date.now()}.${extension}`;
-};
 
 // Helper function to clean filename
 function cleanFilename(filename: string): string {
     return filename.replace(/[^a-z0-9.]/gi, '_').toLowerCase();
+}
+
+// Download to temporary file and return JSON response
+async function downloadToTempFile(url: string, type: DownloadType, platform: string): Promise<DownloadResult> {
+    let tempFilePath: string | null = null;
+    
+    try {
+        console.log(`Downloading ${platform} content to temporary file`);
+        
+        // Create temporary file in our temp directory
+        const ext = type === 'audio' ? 'm4a' : 'mp4';
+        const timestamp = Date.now();
+        const filename = `${platform}_${timestamp}.${ext}`;
+        tempFilePath = path.join(tempDownloadsDir, filename);
+        
+        // Select format based on type with 1080p priority
+        let format: string;
+        if (type === 'audio') {
+            format = 'bestaudio[ext=m4a]/bestaudio/best';
+        } else {
+            console.log(platform,' platform data')
+            // For video, prioritize 1080p, then fall back to best available
+            if (platform === 'youtube') {
+                format = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best';
+                // format = 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best[ext=mp4]/best';
+            } else {
+                // For Instagram/Twitter, use simpler format as they may not have 1080p options
+                format = 'best[height<=1080][ext=mp4]/best[ext=mp4]/best';
+            }
+        }
+        
+        // Download to temporary file
+        const command = `yt-dlp "${url}" -f "${format}" -o "${tempFilePath}" --no-warnings --quiet --write-info-json`;
+        console.log(`Executing download command: ${command}`);
+        
+        await execAsync(command);
+        
+        // Check if file exists and has content
+        if (!fs.existsSync(tempFilePath)) {
+            throw new Error('Downloaded file was not created');
+        }
+        
+        const stats = fs.statSync(tempFilePath);
+        if (stats.size < 1000) {
+            throw new Error('Downloaded file is too small');
+        }
+        
+        // Try to read metadata from info json file
+        console.log(`Download completed: ${filename}`);
+        console.log(`Reading metadata from ${tempFilePath }.info.json`);
+        console.log(platform,'platform data')
+        let meta = {
+            title: `${platform} content`,
+            thumbnail: '',
+            channel: '',
+            hashtags: [],
+            length: '',
+            ageRestriction: false,
+        };
+        
+        try {
+            const infoJsonPath = tempFilePath + '.info.json';
+            if (fs.existsSync(infoJsonPath)) {
+                const info = JSON.parse(fs.readFileSync(infoJsonPath, 'utf8'));
+                meta = {
+                    title: info.title || `${platform} content`,
+                    thumbnail: info.thumbnail || '',
+                    channel: info.uploader || info.channel || '',
+                    hashtags: info.tags || [],
+                    length: info.duration_string || '',
+                    ageRestriction: info.age_limit > 0 || false,
+                };
+                // Clean up the info json file
+                fs.unlinkSync(infoJsonPath);
+            }
+        } catch (e) {
+            console.warn('Could not read metadata:', e);
+        }
+        
+        // Generate unique file ID and track the file
+        const fileId = crypto.randomUUID();
+        tempFiles.set(fileId, {
+            filePath: tempFilePath,
+            filename,
+            createdAt: Date.now(),
+            platform
+        });
+        
+        console.log(`${platform} download completed successfully: ${filename}`);
+        
+        return {
+            success: true,
+            downloadUrl: `/temp/${filename}`,
+            filename,
+            ...meta,
+        };
+        
+    } catch (error) {
+        console.error(`${platform} download error:`, error);
+        
+        // Clean up temp file on error
+        if (tempFilePath && fs.existsSync(tempFilePath)) {
+            fs.unlinkSync(tempFilePath);
+        }
+        
+        throw error;
+    }
 }
 
 // Helper function to check if URL is from YouTube
@@ -155,262 +302,62 @@ function isYouTubeURL(url: string): boolean {
 
 // YouTube download handler
 async function downloadYouTube(url: string, type: DownloadType): Promise<DownloadResult> {
-    let outputPath = ''; // Initialize with empty string
-    try {
-        console.log(`Starting YouTube download for URL: ${url}`);
-
-        // Clean the URL by removing any query parameters
-        const cleanUrl = url.split('?')[0];
-        console.log(`Cleaned URL: ${cleanUrl}`);
-
-        // Select format based on type
-        let format: string;
-        if (type === 'audio') {
-            format = 'bestaudio[ext=m4a]/bestaudio/best';
-        } else {
-            format = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best';
-        }
-        console.log(`Selected format: ${format}`);
-
-        const timestamp = Date.now();
-        const ext = type === 'audio' ? 'm4a' : 'mp4';
-        const filename = `youtube_${timestamp}.${ext}`;
-        outputPath = path.join(downloadsDir, filename);
-        console.log(`Output path: ${outputPath}`);
-
-        // First, try to get video info
-        const infoCommand = `yt-dlp "${cleanUrl}" --dump-json --no-warnings`;
-        console.log(`Executing info command: ${infoCommand}`);
-
-        try {
-            const { stdout: infoJson } = await execAsync(infoCommand);
-            const info = JSON.parse(infoJson);
-            console.log('Video info retrieved successfully');
-        } catch (infoError) {
-            console.error('Error getting video info:', infoError);
-            throw new Error('Could not get video information. The video might be private or restricted.');
-        }
-
-        // Single command to download and get metadata
-        const command = `yt-dlp "${cleanUrl}" -f "${format}" -o "${outputPath}" --write-info-json --no-warnings --progress --newline`;
-        console.log(`Executing download command: ${command}`);
-
-        const { stdout, stderr } = await execAsync(command);
-
-        if (stderr) {
-            console.error('YouTube download error:', stderr);
-            throw new Error('Failed to download from YouTube');
-        }
-
-        // Wait a moment to ensure file is written
-        await new Promise(resolve => setTimeout(resolve, 1000));
-
-        // Verify the downloaded file
-        if (!fs.existsSync(outputPath)) {
-            console.error('File not found at path:', outputPath);
-            throw new Error('Downloaded file not found');
-        }
-
-        const stats = fs.statSync(outputPath);
-        console.log(`Downloaded file size: ${stats.size} bytes`);
-
-        if (stats.size < 1000) { // Less than 1KB
-            console.error('File too small:', stats.size);
-            throw new Error('Downloaded file is too small, download may have failed');
-        }
-
-        // Try to read metadata from the info json file
-        let meta = {
-            title: 'YouTube Video',
-            thumbnail: '',
-            channel: '',
-            hashtags: [],
-            length: '',
-            ageRestriction: false,
-        };
-
-        try {
-            const infoJsonPath = outputPath + '.info.json';
-            if (fs.existsSync(infoJsonPath)) {
-                const info = JSON.parse(fs.readFileSync(infoJsonPath, 'utf8'));
-                meta = {
-                    title: info.title || 'YouTube Video',
-                    thumbnail: info.thumbnail || '',
-                    channel: info.uploader || '',
-                    hashtags: info.tags || [],
-                    length: info.duration_string || '',
-                    ageRestriction: info.age_limit > 0,
-                };
-                // Clean up the info json file
-                fs.unlinkSync(infoJsonPath);
-            }
-        } catch (e) {
-            console.warn('Could not read metadata:', e);
-            // Continue with default metadata
-        }
-
-        console.log('Download completed successfully');
-        return {
-            success: true,
-            downloadUrl: `/downloads/${filename}`,
-            filename,
-            ...meta,
-        };
-    } catch (error: unknown) {
-        console.error('YouTube download error:', error);
-        // Clean up any partial download
-        try {
-            if (outputPath && fs.existsSync(outputPath)) {
-                fs.unlinkSync(outputPath);
-            }
-            // Also clean up info json if it exists
-            const infoJsonPath = outputPath + '.info.json';
-            if (fs.existsSync(infoJsonPath)) {
-                fs.unlinkSync(infoJsonPath);
-            }
-        } catch (cleanupError) {
-            console.error('Error cleaning up files:', cleanupError);
-        }
-        throw error;
-    }
+    return await downloadToTempFile(url, type, 'youtube');
 }
 
 // Instagram download handler
 async function downloadInstagram(url: string, type: DownloadType): Promise<DownloadResult> {
-    try {
-        console.log(`Starting Instagram download for URL: ${url}`);
-
-        const timestamp = Date.now();
-        const ext = type === 'audio' ? 'm4a' : 'mp4';
-        const filename = `instagram_${timestamp}.${ext}`;
-        const outputPath = path.join(downloadsDir, filename);
-        console.log(`Output path: ${outputPath}`);
-
-        // Select format based on type
-        let format;
-        if (type === 'audio') {
-            format = 'bestaudio[ext=m4a]/bestaudio/best';
-        } else {
-            format = 'best[ext=mp4]/best';
-        }
-        console.log(`Selected format: ${format}`);
-
-        // Build the command with additional options
-        const command = `yt-dlp "${url}" -f "${format}" -o "${outputPath}" --no-warnings --progress --newline`;
-        console.log(`Executing command: ${command}`);
-
-        const { stdout, stderr } = await execAsync(command);
-
-        if (stderr) {
-            console.error('Instagram download error:', stderr);
-            throw new Error('Failed to download from Instagram');
-        }
-
-        // Verify the downloaded file
-        if (!fs.existsSync(outputPath)) {
-            throw new Error('Downloaded file not found');
-        }
-
-        const stats = fs.statSync(outputPath);
-        console.log(`Downloaded file size: ${stats.size} bytes`);
-
-        if (stats.size < 1000) { // Less than 1KB
-            throw new Error('Downloaded file is too small, download may have failed');
-        }
-
-        // Mock metadata for Instagram
-        const meta = {
-            title: `Instagram Post ${timestamp}`,
-            thumbnail: '',
-            channel: '',
-            hashtags: [],
-            length: '',
-            ageRestriction: false,
-        };
-
-        console.log('Download completed successfully');
-        return {
-            success: true,
-            downloadUrl: `/downloads/${filename}`,
-            filename,
-            ...meta,
-        };
-    } catch (error) {
-        console.error('Instagram download error:', error);
-        throw error;
-    }
+    return await downloadToTempFile(url, type, 'instagram');
 }
 
-// Twitter/X download handler
+// Twitter download handler
 async function downloadTwitter(url: string, type: DownloadType): Promise<DownloadResult> {
-    try {
-        console.log(`Starting Twitter download for URL: ${url}`);
-
-        const timestamp = Date.now();
-        const ext = type === 'audio' ? 'm4a' : 'mp4';
-        const filename = `twitter_${timestamp}.${ext}`;
-        const outputPath = path.join(downloadsDir, filename);
-        console.log(`Output path: ${outputPath}`);
-
-        // Select format based on type
-        let format;
-        if (type === 'audio') {
-            format = 'bestaudio[ext=m4a]/bestaudio/best';
-        } else {
-            format = 'best[ext=mp4]/best';
-        }
-        console.log(`Selected format: ${format}`);
-
-        // Build the command with additional options
-        const command = `yt-dlp "${url}" -f "${format}" -o "${outputPath}" --no-warnings --progress --newline`;
-        console.log(`Executing command: ${command}`);
-
-        const { stdout, stderr } = await execAsync(command);
-
-        if (stderr) {
-            console.error('Twitter download error:', stderr);
-            throw new Error('Failed to download from Twitter');
-        }
-
-        // Verify the downloaded file
-        if (!fs.existsSync(outputPath)) {
-            throw new Error('Downloaded file not found');
-        }
-
-        const stats = fs.statSync(outputPath);
-        console.log(`Downloaded file size: ${stats.size} bytes`);
-
-        if (stats.size < 1000) { // Less than 1KB
-            throw new Error('Downloaded file is too small, download may have failed');
-        }
-
-        // Mock metadata for Twitter
-        const meta = {
-            title: `Twitter Post ${timestamp}`,
-            thumbnail: '',
-            channel: '',
-            hashtags: [],
-            length: '',
-            ageRestriction: false,
-        };
-
-        console.log('Download completed successfully');
-        return {
-            success: true,
-            downloadUrl: `/downloads/${filename}`,
-            filename,
-            ...meta,
-        };
-    } catch (error) {
-        console.error('Twitter download error:', error);
-        throw error;
-    }
+    return await downloadToTempFile(url, type, 'twitter');
 }
 
-// Download route
+// Download route - Returns JSON with temporary download URL
 app.post('/api/download', async (request: FastifyRequest<{ Body: DownloadRequest }>, reply: FastifyReply) => {
     try {
+        // Validate request body
+        if (!request.body) {
+            return reply.code(400).send({
+                success: false,
+                error: 'Request body is required'
+            });
+        }
+
         const { url, type } = request.body;
+
+        // Validate required fields
+        if (!url || typeof url !== 'string') {
+            return reply.code(400).send({
+                success: false,
+                error: 'URL is required and must be a string'
+            });
+        }
+
+        if (!type || typeof type !== 'string') {
+            return reply.code(400).send({
+                success: false,
+                error: 'Type is required and must be either "video" or "audio"'
+            });
+        }
+
+        if (type !== 'video' && type !== 'audio') {
+            return reply.code(400).send({
+                success: false,
+                error: 'Type must be either "video" or "audio"'
+            });
+        }
+
+        // Validate URL format
+        if (!url.trim()) {
+            return reply.code(400).send({
+                success: false,
+                error: 'URL cannot be empty'
+            });
+        }
+
         let result: DownloadResult;
 
         if (isYouTubeURL(url)) {
@@ -422,20 +369,13 @@ app.post('/api/download', async (request: FastifyRequest<{ Body: DownloadRequest
         } else {
             return reply.code(400).send({
                 success: false,
-                error: 'Unsupported platform'
+                error: 'Unsupported platform. Supported platforms: YouTube, Instagram, Twitter/X'
             });
         }
 
         return reply.send(result);
     } catch (error: unknown) {
         console.error('Download error:', error);
-        if (isDownloadError(error)) {
-            return reply.code(500).send({
-                success: false,
-                error: error.message || 'Unknown error occurred',
-                filename: error.filename
-            });
-        }
         return reply.code(500).send({
             success: false,
             error: error instanceof Error ? error.message : 'Unknown error occurred'
@@ -443,38 +383,7 @@ app.post('/api/download', async (request: FastifyRequest<{ Body: DownloadRequest
     }
 });
 
-// Serve downloaded files with proper headers
-app.get('/downloads/:filename', async (request, reply) => {
-    try {
-        const { filename } = request.params as { filename: string };
-        const filepath = path.join(downloadsDir, filename);
-
-        if (!fs.existsSync(filepath)) {
-            return reply.code(404).send({ success: false, message: 'File not found' });
-        }
-
-        const stats = fs.statSync(filepath);
-        if (stats.size < 1000) {
-            return reply.code(500).send({ success: false, message: 'File is too small, download may have failed' });
-        }
-
-        // Set headers
-        reply.header('Content-Disposition', `attachment; filename="${filename}"`);
-        reply.header('Content-Type', filename.endsWith('.mp4') ? 'video/mp4' : 'audio/mp4');
-        reply.header('Content-Length', stats.size);
-        reply.header('Access-Control-Expose-Headers', 'Content-Disposition');
-
-        // Create a read stream and pipe it to the response
-        const stream = fs.createReadStream(filepath);
-        return reply.send(stream);
-    } catch (error) {
-        console.error('Error serving file:', error);
-        return reply.code(500).send({
-            success: false,
-            message: 'Error serving file: ' + (error instanceof Error ? error.message : 'Unknown error')
-        });
-    }
-});
+// Note: Temporary files are served via /temp/ endpoint and cleaned up automatically
 
 // Info route to get video information
 app.get('/api/info', async (request: FastifyRequest<{ Querystring: { url: string } }>, reply: FastifyReply) => {
@@ -558,33 +467,59 @@ app.get('/', async (request, reply) => {
     return { message: 'Social Media Downloader API is running' }
 });
 
-// Health check route
-app.get('/health', async () => {
-    return { status: 'ok' };
-});
+// Health check route removed to avoid conflict with healthPlugin
 
 // Start server
 const start = async () => {
     try {
-        await app.listen({ port: 2500, host: '0.0.0.0' });
-        console.log('Server is running on port 2500');
+        await app.listen({ 
+            port: appConfig.port, 
+            host: appConfig.host 
+        });
+        
+        app.log.info({
+            port: appConfig.port,
+            host: appConfig.host,
+            environment: appConfig.nodeEnv,
+            swagger: appConfig.enableSwagger ? `http://${appConfig.host}:${appConfig.port}/documentation` : 'disabled'
+        }, 'Server started successfully');
+        
     } catch (err) {
-        app.log.error(err);
+        app.log.error(err, 'Failed to start server');
         process.exit(1);
     }
 };
 
+// Graceful shutdown handling
+const gracefulShutdown = async (signal: string) => {
+    app.log.info(`Received ${signal}, starting graceful shutdown...`);
+    
+    try {
+        await app.close();
+        app.log.info('Server closed successfully');
+        process.exit(0);
+    } catch (err) {
+        app.log.error(err, 'Error during graceful shutdown');
+        process.exit(1);
+    }
+};
+
+// Handle shutdown signals
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
 // Handle uncaught exceptions
 process.on('uncaughtException', (err) => {
-    app.log.error('Uncaught Exception:', err);
+    app.log.error({ err }, 'Uncaught Exception');
     process.exit(1);
 });
 
 // Handle unhandled promise rejections
-process.on('unhandledRejection', (err) => {
-    app.log.error('Unhandled Rejection:', err);
+process.on('unhandledRejection', (reason, promise) => {
+    app.log.error({ reason, promise }, 'Unhandled Rejection');
     process.exit(1);
 });
 
+// Start the server
 start();
 
