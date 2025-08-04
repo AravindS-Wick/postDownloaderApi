@@ -1,5 +1,5 @@
 import { vi } from 'vitest';
-import { FastifyInstance } from 'fastify';
+import type { FastifyInstance } from 'fastify';
 
 export const mockFastifyInstance = {
     jwt: {
