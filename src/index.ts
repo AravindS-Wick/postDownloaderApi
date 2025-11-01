@@ -3,7 +3,6 @@ import cors from '@fastify/cors';
 import swagger from '@fastify/swagger';
 import swaggerUi from '@fastify/swagger-ui';
 import { TwitterApi } from 'twitter-api-v2';
-import { IgApiClient } from 'instagram-private-api';
 import ytdl from 'ytdl-core';
 import path from 'path';
 import fs from 'fs';
@@ -155,7 +154,6 @@ app.register(fastifyStatic, {
 
 // Initialize platform-specific clients
 const twitterClient = new TwitterApi(process.env.TWITTER_BEARER_TOKEN || '');
-const ig = new IgApiClient();
 
 // Register routes
 app.register(authRoutes, { prefix: '/api/auth' });
@@ -180,6 +178,10 @@ interface DownloadResult {
     hashtags?: string[];
     length?: string;
     ageRestriction?: boolean;
+}
+
+interface InfoQuerystring {
+    url: string;
 }
 
 
@@ -209,8 +211,8 @@ async function downloadToTempFile(url: string, type: DownloadType, platform: str
             console.log(platform,' platform data')
             // For video, prioritize 1080p, then fall back to best available
             if (platform === 'youtube') {
-                format = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best';
-                // format = 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best[ext=mp4]/best';
+                // format = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best';
+                format = 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best[ext=mp4]/best';
             } else {
                 // For Instagram/Twitter, use simpler format as they may not have 1080p options
                 format = 'best[height<=1080][ext=mp4]/best[ext=mp4]/best';
@@ -386,7 +388,10 @@ app.post('/api/download', async (request: FastifyRequest<{ Body: DownloadRequest
 // Note: Temporary files are served via /temp/ endpoint and cleaned up automatically
 
 // Info route to get video information
-app.get('/api/info', async (request: FastifyRequest<{ Querystring: { url: string } }>, reply: FastifyReply) => {
+async function handleInfoRequest(
+    request: FastifyRequest<{ Querystring: InfoQuerystring }>,
+    reply: FastifyReply
+) {
     try {
         const { url } = request.query;
         if (!url) {
@@ -460,7 +465,10 @@ app.get('/api/info', async (request: FastifyRequest<{ Querystring: { url: string
             error: error instanceof Error ? error.message : 'Unknown error occurred'
         });
     }
-});
+}
+
+app.get('/api/info', handleInfoRequest);
+app.get('/api/media/info', handleInfoRequest);
 
 // Add root route handler
 app.get('/', async (request, reply) => {
@@ -522,4 +530,3 @@ process.on('unhandledRejection', (reason, promise) => {
 
 // Start the server
 start();
-
