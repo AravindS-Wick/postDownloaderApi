@@ -23,4 +23,3 @@ coverage
 *.swp
 *.bak
 *.orig
-/test-downloads/*
