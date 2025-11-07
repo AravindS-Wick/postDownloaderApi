@@ -13,8 +13,12 @@ app.get('/', (req: Request, res: Response) => {
 
 // Start the server
 const PORT = 8081;
+const PORT1 = 8082;
 // const PORT = 2000;
 // const PORT = 2100;
 app.listen(PORT, () => {
     console.log(`Frontend server running on http://localhost:${PORT}`);
+}); 
+app.listen(PORT1, () => {
+    console.log(`Frontend server running on http://localhost:${PORT1}`);
 }); 

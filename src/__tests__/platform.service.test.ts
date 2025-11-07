@@ -1,149 +1,133 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { PlatformService } from '../services/platform.service';
+import fastify from 'fastify';
+import axios from 'axios';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { PlatformService } from '../services/platform.service.js';
+import type { PlatformAuthConfig } from '../types/auth.types.js';
+
+vi.mock('axios', () => ({
+    default: {
+        post: vi.fn()
+    }
+}));
+
+const PLATFORM_CONFIG: PlatformAuthConfig = {
+    clientId: 'client-id',
+    clientSecret: 'client-secret',
+    redirectUri: 'https://example.com/callback',
+    scope: ['test:scope'],
+    authUrl: 'https://example.com/auth'
+};
 
 describe('PlatformService', () => {
-    let platformService: PlatformService;
+    const server = fastify();
+    const service = new PlatformService(server);
 
     beforeEach(() => {
-        platformService = new PlatformService({
-            instagram: {
-                clientId: 'test-instagram-client-id',
-                clientSecret: 'test-instagram-client-secret',
-                redirectUri: 'http://localhost:3000/auth/instagram/callback'
-            },
-            youtube: {
-                clientId: 'test-youtube-client-id',
-                clientSecret: 'test-youtube-client-secret',
-                redirectUri: 'http://localhost:3000/auth/youtube/callback'
-            },
-            twitter: {
-                clientId: 'test-twitter-client-id',
-                clientSecret: 'test-twitter-client-secret',
-                redirectUri: 'http://localhost:3000/auth/twitter/callback'
-            },
-            tiktok: {
-                clientId: 'test-tiktok-client-id',
-                clientSecret: 'test-tiktok-client-secret',
-                redirectUri: 'http://localhost:3000/auth/tiktok/callback'
-            }
+        vi.clearAllMocks();
+    });
+
+    afterEach(() => {
+        vi.clearAllMocks();
+        vi.unstubAllGlobals();
+    });
+
+    describe('OAuth URL builders', () => {
+        it('builds Instagram authorization URL', async () => {
+            const url = await service.getInstagramAuthUrl(PLATFORM_CONFIG);
+            expect(url).toContain('https://api.instagram.com/oauth/authorize');
+            expect(url).toContain(`client_id=${PLATFORM_CONFIG.clientId}`);
+            expect(url).toContain(`redirect_uri=${encodeURIComponent(PLATFORM_CONFIG.redirectUri)}`);
+        });
+
+        it('builds YouTube authorization URL', async () => {
+            const url = await service.getYouTubeAuthUrl(PLATFORM_CONFIG);
+            expect(url).toContain('https://accounts.google.com/o/oauth2/v2/auth');
+            expect(url).toContain(`client_id=${PLATFORM_CONFIG.clientId}`);
+        });
+
+        it('builds Twitter authorization URL', async () => {
+            const url = await service.getTwitterAuthUrl(PLATFORM_CONFIG);
+            expect(url).toContain('https://twitter.com/i/oauth2/authorize');
+            expect(url).toContain(`client_id=${PLATFORM_CONFIG.clientId}`);
+        });
+
+        it('builds TikTok authorization URL', async () => {
+            const url = await service.getTikTokAuthUrl(PLATFORM_CONFIG);
+            expect(url).toContain('https://www.tiktok.com/auth/authorize');
+            expect(url).toContain(`client_key=${PLATFORM_CONFIG.clientId}`);
         });
     });
 
-    describe('getInstagramAuthUrl', () => {
-        it('should return Instagram auth URL', () => {
-            const url = platformService.getInstagramAuthUrl();
-            expect(url).toContain('instagram.com/oauth/authorize');
-            expect(url).toContain('test-instagram-client-id');
-            expect(url).toContain('http://localhost:3000/auth/instagram/callback');
-        });
-    });
+    describe('callback handlers', () => {
+        it('handles Instagram callback', async () => {
+            vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+                ok: true,
+                json: () => Promise.resolve({
+                    access_token: 'access',
+                    expires_in: 3600
+                })
+            } as any));
 
-    describe('getYouTubeAuthUrl', () => {
-        it('should return YouTube auth URL', () => {
-            const url = platformService.getYouTubeAuthUrl();
-            expect(url).toContain('accounts.google.com/o/oauth2/v2/auth');
-            expect(url).toContain('test-youtube-client-id');
-            expect(url).toContain('http://localhost:3000/auth/youtube/callback');
-        });
-    });
-
-    describe('getTwitterAuthUrl', () => {
-        it('should return Twitter auth URL', () => {
-            const url = platformService.getTwitterAuthUrl();
-            expect(url).toContain('twitter.com/i/oauth2/authorize');
-            expect(url).toContain('test-twitter-client-id');
-            expect(url).toContain('http://localhost:3000/auth/twitter/callback');
-        });
-    });
-
-    describe('getTikTokAuthUrl', () => {
-        it('should return TikTok auth URL', () => {
-            const url = platformService.getTikTokAuthUrl();
-            expect(url).toContain('tiktok.com/auth/authorize');
-            expect(url).toContain('test-tiktok-client-id');
-            expect(url).toContain('http://localhost:3000/auth/tiktok/callback');
-        });
-    });
-
-    describe('handleInstagramCallback', () => {
-        it('should handle Instagram callback and return tokens', async () => {
-            const mockResponse = {
-                access_token: 'test-access-token',
-                expires_in: 3600
-            };
-
-            global.fetch = vi.fn().mockResolvedValue({
-                json: () => Promise.resolve(mockResponse)
-            });
-
-            const result = await platformService.handleInstagramCallback('test-code');
+            const result = await service.handleInstagramCallback('code', PLATFORM_CONFIG);
             expect(result).toEqual({
-                accessToken: 'test-access-token',
+                accessToken: 'access',
                 expiresIn: 3600
             });
         });
-    });
 
-    describe('handleYouTubeCallback', () => {
-        it('should handle YouTube callback and return tokens', async () => {
-            const mockResponse = {
-                access_token: 'test-access-token',
-                refresh_token: 'test-refresh-token',
-                expires_in: 3600
-            };
+        it('handles YouTube callback', async () => {
+            vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+                ok: true,
+                json: () => Promise.resolve({
+                    access_token: 'yt-access',
+                    refresh_token: 'yt-refresh',
+                    expires_in: 3600
+                })
+            } as any));
 
-            global.fetch = vi.fn().mockResolvedValue({
-                json: () => Promise.resolve(mockResponse)
-            });
-
-            const result = await platformService.handleYouTubeCallback('test-code');
+            const result = await service.handleYouTubeCallback('code', PLATFORM_CONFIG);
             expect(result).toEqual({
-                accessToken: 'test-access-token',
-                refreshToken: 'test-refresh-token',
+                accessToken: 'yt-access',
+                refreshToken: 'yt-refresh',
                 expiresIn: 3600
             });
         });
-    });
 
-    describe('handleTwitterCallback', () => {
-        it('should handle Twitter callback and return tokens', async () => {
-            const mockResponse = {
-                access_token: 'test-access-token',
-                refresh_token: 'test-refresh-token',
-                expires_in: 3600
-            };
+        it('handles Twitter callback', async () => {
+            vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+                ok: true,
+                json: () => Promise.resolve({
+                    access_token: 'tw-access',
+                    refresh_token: 'tw-refresh',
+                    expires_in: 7200
+                })
+            } as any));
 
-            global.fetch = vi.fn().mockResolvedValue({
-                json: () => Promise.resolve(mockResponse)
-            });
-
-            const result = await platformService.handleTwitterCallback('test-code');
+            const result = await service.handleTwitterCallback('code', PLATFORM_CONFIG);
             expect(result).toEqual({
-                accessToken: 'test-access-token',
-                refreshToken: 'test-refresh-token',
-                expiresIn: 3600
+                accessToken: 'tw-access',
+                refreshToken: 'tw-refresh',
+                expiresIn: 7200
             });
         });
-    });
 
-    describe('handleTikTokCallback', () => {
-        it('should handle TikTok callback and return tokens', async () => {
-            const mockResponse = {
-                access_token: 'test-access-token',
-                refresh_token: 'test-refresh-token',
-                expires_in: 3600
-            };
-
-            global.fetch = vi.fn().mockResolvedValue({
-                json: () => Promise.resolve(mockResponse)
+        it('handles TikTok callback', async () => {
+            const mockedPost = vi.mocked((axios as any).post, true);
+            mockedPost.mockResolvedValueOnce({
+                data: {
+                    access_token: 'tk-access',
+                    refresh_token: 'tk-refresh',
+                    expires_in: 3600
+                }
             });
 
-            const result = await platformService.handleTikTokCallback('test-code');
+            const result = await service.handleTikTokCallback('code', PLATFORM_CONFIG);
             expect(result).toEqual({
-                accessToken: 'test-access-token',
-                refreshToken: 'test-refresh-token',
+                accessToken: 'tk-access',
+                refreshToken: 'tk-refresh',
                 expiresIn: 3600
             });
+            expect(mockedPost).toHaveBeenCalled();
         });
     });
-}); 
+});

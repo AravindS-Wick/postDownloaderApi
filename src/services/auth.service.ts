@@ -19,9 +19,9 @@ export class AuthService {
             id: '1',
             email,
             name: 'Test User',
-            connectedPlatforms: []
+            platforms: []
         };
-        const payload: JwtPayload = { userId: user.id };
+        const payload: JwtPayload = { userId: user.id, email: user.email };
         const token = this.fastify.jwt.sign(payload);
         return { token, user };
     }
