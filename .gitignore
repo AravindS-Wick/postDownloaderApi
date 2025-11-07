@@ -24,3 +24,4 @@ coverage
 *.bak
 *.orig
 .zencoder
+/test-downloads/*
