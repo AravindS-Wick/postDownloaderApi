@@ -23,4 +23,5 @@ coverage
 *.swp
 *.bak
 *.orig
+.zencoder
 /test-downloads/*

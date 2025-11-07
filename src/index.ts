@@ -3,7 +3,6 @@ import cors from '@fastify/cors';
 import swagger from '@fastify/swagger';
 import swaggerUi from '@fastify/swagger-ui';
 import { TwitterApi } from 'twitter-api-v2';
-import { IgApiClient } from 'instagram-private-api';
 import ytdl from 'ytdl-core';
 import path from 'path';
 import fs from 'fs';
@@ -16,6 +15,12 @@ import dotenv from 'dotenv';
 import jwt from '@fastify/jwt';
 import { fileURLToPath } from 'url';
 import fastifyStatic from '@fastify/static';
+import {
+    buildDownloadFilename,
+    isYouTubeUrl,
+    normalizeYouTubeUrl,
+    sanitizeFilenameComponent
+} from './utils/download-utils.js';
 
 dotenv.config();
 
@@ -49,10 +54,12 @@ app.register(cors, {
     origin: [
         'http://localhost:2000',
         'http://localhost:8081',
+        'http://localhost:8082',
         'http://localhost:19006', // Add web client origin
         'exp://localhost:2100',
         'exp://127.0.0.1:2100',
-        'exp://127.0.0.1:8081'
+        'exp://127.0.0.1:8081',
+        'exp://127.0.0.1:8082'
     ],
     methods: ['GET', 'POST', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'Content-Disposition', 'Accept', 'Origin', 'X-Requested-With'],
@@ -104,7 +111,6 @@ app.register(fastifyStatic, {
 
 // Initialize platform-specific clients
 const twitterClient = new TwitterApi(process.env.TWITTER_BEARER_TOKEN || '');
-const ig = new IgApiClient();
 
 // Register routes
 app.register(authRoutes, { prefix: '/api/auth' });
@@ -121,12 +127,18 @@ type DownloadResult = {
     hashtags?: string[];
     length?: string;
     ageRestriction?: boolean;
+    quality?: string;
 };
 
 // Define request body type
 interface DownloadRequest {
     url: string;
     type: DownloadType;
+    format?: string;
+    quality?: string;
+    useAutoFormat?: boolean;
+    preferProgressive?: boolean;
+    maxHeight?: number;
 }
 
 // Define error types
@@ -148,58 +160,210 @@ function cleanFilename(filename: string): string {
     return filename.replace(/[^a-z0-9.]/gi, '_').toLowerCase();
 }
 
-// Helper function to check if URL is from YouTube
-function isYouTubeURL(url: string): boolean {
-    return url.includes('youtube.com') || url.includes('youtu.be');
-}
 
 // YouTube download handler
-async function downloadYouTube(url: string, type: DownloadType): Promise<DownloadResult> {
+async function downloadYouTube(url: string, type: DownloadType, options?: {
+    preferredFormat?: string;
+    fallbackToAuto?: boolean;
+    allowProgressiveOnly?: boolean;
+    allowAdaptive?: boolean;
+    quality?: string;
+    preferProgressive?: boolean;
+    maxHeight?: number;
+}): Promise<DownloadResult> {
     let outputPath = ''; // Initialize with empty string
     try {
         console.log(`Starting YouTube download for URL: ${url}`);
 
-        // Clean the URL by removing any query parameters
-        const cleanUrl = url.split('?')[0];
-        console.log(`Cleaned URL: ${cleanUrl}`);
+        const cleanUrl = normalizeYouTubeUrl(url);
+        console.log(`Normalized URL: ${cleanUrl}`);
 
-        // Select format based on type
-        let format: string;
-        if (type === 'audio') {
-            format = 'bestaudio[ext=m4a]/bestaudio/best';
-        } else {
-            format = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best';
-        }
-        console.log(`Selected format: ${format}`);
-
-        const timestamp = Date.now();
         const ext = type === 'audio' ? 'm4a' : 'mp4';
-        const filename = `youtube_${timestamp}.${ext}`;
-        outputPath = path.join(downloadsDir, filename);
-        console.log(`Output path: ${outputPath}`);
 
-        // First, try to get video info
         const infoCommand = `yt-dlp "${cleanUrl}" --dump-json --no-warnings`;
         console.log(`Executing info command: ${infoCommand}`);
 
+        let videoInfo: any = null;
         try {
             const { stdout: infoJson } = await execAsync(infoCommand);
-            const info = JSON.parse(infoJson);
+            videoInfo = JSON.parse(infoJson);
             console.log('Video info retrieved successfully');
         } catch (infoError) {
             console.error('Error getting video info:', infoError);
             throw new Error('Could not get video information. The video might be private or restricted.');
         }
 
-        // Single command to download and get metadata
-        const command = `yt-dlp "${cleanUrl}" -f "${format}" -o "${outputPath}" --write-info-json --no-warnings --progress --newline`;
+        let selectedFormat: string | null = null;
+        let selectedQualityLabel: string | undefined;
+
+        interface YtFormat {
+            format_id: string;
+            height?: number;
+            acodec: string;
+            vcodec: string;
+            ext: string;
+            filesize?: number;
+            abr?: number;
+            tbr?: number;
+            format_note?: string;
+            resolution?: string;
+        }
+
+        const formats = (videoInfo?.formats ?? []) as YtFormat[];
+        const progressiveFormats = formats.filter(f => f.acodec !== 'none' && f.vcodec !== 'none');
+        const adaptiveFormats = formats.filter(f => f.acodec === 'none' || f.vcodec === 'none');
+
+        const qualityPreference = options?.quality;
+        const preferredFormat = options?.preferredFormat;
+        const allowAdaptive = options?.allowAdaptive !== false;
+        const normalizedQualityPreference = qualityPreference ? qualityPreference.toLowerCase().trim() : null;
+
+        const parseQualityHeight = (value: string): number | null => {
+            const digits = value.match(/\d+/g);
+            if (!digits || !digits.length) {
+                return null;
+            }
+            const numeric = parseInt(digits[0], 10);
+            return Number.isFinite(numeric) ? numeric : null;
+        };
+
+        const numericQualityPreference = normalizedQualityPreference
+            ? parseQualityHeight(normalizedQualityPreference)
+            : null;
+
+        if (preferredFormat) {
+            const preferred = formats.find(f => f.format_id === preferredFormat || f.format_note === preferredFormat);
+            if (preferred) {
+                if (preferred.acodec !== 'none' && preferred.vcodec !== 'none') {
+                    selectedFormat = preferred.format_id;
+                } else if (allowAdaptive) {
+                    const matchingAudio = adaptiveFormats.find(f => f.acodec !== 'none');
+                    if (matchingAudio) {
+                        selectedFormat = `${preferred.format_id}+${matchingAudio.format_id}`;
+                    }
+                }
+            }
+        }
+
+        const pickByQuality = (candidateFormats: YtFormat[]) => {
+            if (!candidateFormats.length) {
+                return null;
+            }
+            const sorted = candidateFormats.sort((a, b) => ((b.height ?? 0) - (a.height ?? 0)) || ((b.filesize ?? 0) - (a.filesize ?? 0)) || ((b.tbr ?? 0) - (a.tbr ?? 0)));
+            if (!normalizedQualityPreference) {
+                return sorted[0];
+            }
+
+            if (normalizedQualityPreference === 'best') {
+                return sorted[0];
+            }
+
+            if (numericQualityPreference && numericQualityPreference > 0) {
+                const exactHeight = sorted.find(f => (f.height ?? 0) === numericQualityPreference);
+                if (exactHeight) {
+                    return exactHeight;
+                }
+
+                const bestBelowOrEqual = sorted.find(f => (f.height ?? 0) > 0 && (f.height ?? 0) <= numericQualityPreference);
+                if (bestBelowOrEqual) {
+                    return bestBelowOrEqual;
+                }
+            }
+
+            const byHeightLabel = sorted.find(f => (f.height ? `${f.height}p` : '').toLowerCase() === normalizedQualityPreference);
+            if (byHeightLabel) {
+                return byHeightLabel;
+            }
+
+            const byNote = sorted.find(f => (f.format_note || '').toLowerCase() === normalizedQualityPreference);
+            if (byNote) {
+                return byNote;
+            }
+
+            return sorted[0];
+        };
+
+        const deriveQualityLabel = (format: YtFormat | null): string | undefined => {
+            if (!format) {
+                return undefined;
+            }
+            if (format.height) {
+                return `${format.height}p`;
+            }
+            if (format.format_note) {
+                return format.format_note;
+            }
+            if (format.abr) {
+                return `${format.abr}kbps`;
+            }
+            if (format.tbr) {
+                return `${Math.round(format.tbr)}kbps`;
+            }
+            return format.resolution;
+        };
+
+        if (!selectedFormat && type === 'audio') {
+            const audioFormat = pickByQuality(adaptiveFormats.filter(f => f.acodec !== 'none'));
+            if (audioFormat) {
+                selectedFormat = audioFormat.format_id;
+                selectedQualityLabel = deriveQualityLabel(audioFormat);
+            }
+        }
+
+        if (!selectedFormat && type !== 'audio') {
+            const progressiveSelection = pickByQuality(progressiveFormats);
+            if (progressiveSelection) {
+                const progressiveHeight = progressiveSelection.height ?? null;
+                const needsHigherThanProgressive = Boolean(
+                    numericQualityPreference &&
+                    progressiveHeight &&
+                    progressiveHeight < numericQualityPreference
+                );
+                if (!needsHigherThanProgressive || !allowAdaptive) {
+                    selectedFormat = progressiveSelection.format_id;
+                    selectedQualityLabel = deriveQualityLabel(progressiveSelection);
+                }
+            }
+        }
+
+        if (!selectedFormat && type !== 'audio' && allowAdaptive) {
+            const videoOnlySorted = adaptiveFormats.filter(f => f.vcodec !== 'none' && f.acodec === 'none');
+            const audioOnlySorted = adaptiveFormats.filter(f => f.acodec !== 'none' && f.vcodec === 'none');
+            const videoSelection = pickByQuality(videoOnlySorted);
+            const audioSelection = pickByQuality(audioOnlySorted);
+            if (videoSelection && audioSelection) {
+                selectedFormat = `${videoSelection.format_id}+${audioSelection.format_id}`;
+                selectedQualityLabel = deriveQualityLabel(videoSelection) || deriveQualityLabel(audioSelection);
+            }
+        }
+
+        if (!selectedFormat) {
+            selectedFormat = type === 'audio'
+                ? 'bestaudio[ext=m4a]/bestaudio/best'
+                : 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best';
+        }
+
+        if (!selectedQualityLabel && typeof videoInfo?.requested_downloads === 'object') {
+            const requested = Array.isArray(videoInfo.requested_downloads)
+                ? videoInfo.requested_downloads[0]
+                : videoInfo.requested_downloads;
+            if (requested && requested.format_note) {
+                selectedQualityLabel = requested.format_note;
+            }
+        }
+
+        console.log(`Selected format: ${selectedFormat}`);
+        const tempFilename = `youtube_${Date.now()}.${ext}`;
+        outputPath = path.join(downloadsDir, tempFilename);
+        console.log(`Output path: ${outputPath}`);
+        const command = `yt-dlp "${cleanUrl}" -f "${selectedFormat}" -o "${outputPath}" --write-info-json --no-warnings --progress --newline`;
         console.log(`Executing download command: ${command}`);
 
-        const { stdout, stderr } = await execAsync(command);
+        const { stderr } = await execAsync(command);
 
-        if (stderr) {
+        if (stderr && stderr.includes('ERROR')) {
             console.error('YouTube download error:', stderr);
-            throw new Error('Failed to download from YouTube');
+            throw new Error('Failed to download from YouTube: ' + stderr);
         }
 
         // Wait a moment to ensure file is written
@@ -209,6 +373,24 @@ async function downloadYouTube(url: string, type: DownloadType): Promise<Downloa
         if (!fs.existsSync(outputPath)) {
             console.error('File not found at path:', outputPath);
             throw new Error('Downloaded file not found');
+        }
+        if (!selectedQualityLabel) {
+            const pathParts = outputPath.split('.');
+            const infoJsonPath = `${pathParts.slice(0, -1).join('.')}.info.json`;
+            if (fs.existsSync(infoJsonPath)) {
+                try {
+                    const info = JSON.parse(fs.readFileSync(infoJsonPath, 'utf8'));
+                    if (info.format_note) {
+                        selectedQualityLabel = info.format_note;
+                    } else if (info.height) {
+                        selectedQualityLabel = `${info.height}p`;
+                    } else if (info.abr) {
+                        selectedQualityLabel = `${info.abr}kbps`;
+                    }
+                } catch (qualityError) {
+                    console.warn('Could not determine quality from info json:', qualityError);
+                }
+            }
         }
 
         const stats = fs.statSync(outputPath);
@@ -221,12 +403,12 @@ async function downloadYouTube(url: string, type: DownloadType): Promise<Downloa
 
         // Try to read metadata from the info json file
         let meta = {
-            title: 'YouTube Video',
-            thumbnail: '',
-            channel: '',
-            hashtags: [],
-            length: '',
-            ageRestriction: false,
+            title: typeof videoInfo?.title === 'string' ? videoInfo.title : 'YouTube Video',
+            thumbnail: typeof videoInfo?.thumbnail === 'string' ? videoInfo.thumbnail : '',
+            channel: typeof videoInfo?.uploader === 'string' ? videoInfo.uploader : '',
+            hashtags: Array.isArray(videoInfo?.tags) ? videoInfo.tags : [],
+            length: typeof videoInfo?.duration_string === 'string' ? videoInfo.duration_string : (typeof videoInfo?.duration === 'number' ? String(videoInfo.duration) : ''),
+            ageRestriction: Boolean(typeof videoInfo?.age_limit === 'number' && videoInfo.age_limit > 0),
         };
 
         try {
@@ -241,6 +423,15 @@ async function downloadYouTube(url: string, type: DownloadType): Promise<Downloa
                     length: info.duration_string || '',
                     ageRestriction: info.age_limit > 0,
                 };
+                if (!selectedQualityLabel) {
+                    if (info.format_note) {
+                        selectedQualityLabel = info.format_note;
+                    } else if (info.height) {
+                        selectedQualityLabel = `${info.height}p`;
+                    } else if (info.abr) {
+                        selectedQualityLabel = `${info.abr}kbps`;
+                    }
+                }
                 // Clean up the info json file
                 fs.unlinkSync(infoJsonPath);
             }
@@ -249,11 +440,16 @@ async function downloadYouTube(url: string, type: DownloadType): Promise<Downloa
             // Continue with default metadata
         }
 
+        const finalFilename = buildDownloadFilename(downloadsDir, meta.title, selectedQualityLabel, ext);
+        const finalPath = path.join(downloadsDir, finalFilename);
+        fs.renameSync(outputPath, finalPath);
+
         console.log('Download completed successfully');
         return {
             success: true,
-            downloadUrl: `/downloads/${filename}`,
-            filename,
+            downloadUrl: `/downloads/${finalFilename}`,
+            filename: finalFilename,
+            quality: selectedQualityLabel,
             ...meta,
         };
     } catch (error: unknown) {
@@ -328,11 +524,15 @@ async function downloadInstagram(url: string, type: DownloadType): Promise<Downl
             ageRestriction: false,
         };
 
+        const finalFilename = buildDownloadFilename(downloadsDir, meta.title, undefined, ext);
+        const finalPath = path.join(downloadsDir, finalFilename);
+        fs.renameSync(outputPath, finalPath);
+
         console.log('Download completed successfully');
         return {
             success: true,
-            downloadUrl: `/downloads/${filename}`,
-            filename,
+            downloadUrl: `/downloads/${finalFilename}`,
+            filename: finalFilename,
             ...meta,
         };
     } catch (error) {
@@ -394,11 +594,15 @@ async function downloadTwitter(url: string, type: DownloadType): Promise<Downloa
             ageRestriction: false,
         };
 
+        const finalFilename = buildDownloadFilename(downloadsDir, meta.title, undefined, ext);
+        const finalPath = path.join(downloadsDir, finalFilename);
+        fs.renameSync(outputPath, finalPath);
+
         console.log('Download completed successfully');
         return {
             success: true,
-            downloadUrl: `/downloads/${filename}`,
-            filename,
+            downloadUrl: `/downloads/${finalFilename}`,
+            filename: finalFilename,
             ...meta,
         };
     } catch (error) {
@@ -411,10 +615,30 @@ async function downloadTwitter(url: string, type: DownloadType): Promise<Downloa
 app.post('/api/download', async (request: FastifyRequest<{ Body: DownloadRequest }>, reply: FastifyReply) => {
     try {
         const { url, type } = request.body;
+        
+        // ✅ Validate input
+        if (!url) {
+            return reply.code(400).send({
+                success: false,
+                error: 'URL is required'
+            });
+        }
+        
+        if (!type || !['video', 'audio'].includes(type)) {
+            return reply.code(400).send({
+                success: false,
+                error: 'Type must be "video" or "audio"'
+            });
+        }
+
         let result: DownloadResult;
 
-        if (isYouTubeURL(url)) {
-            result = await downloadYouTube(url, type);
+        if (isYouTubeUrl(url)) {
+            result = await downloadYouTube(url, type, {
+                preferredFormat: request.body.format,
+                fallbackToAuto: request.body.useAutoFormat,
+                quality: request.body.quality
+            });
         } else if (url.includes('instagram.com')) {
             result = await downloadInstagram(url, type);
         } else if (url.includes('twitter.com') || url.includes('x.com')) {
@@ -422,23 +646,35 @@ app.post('/api/download', async (request: FastifyRequest<{ Body: DownloadRequest
         } else {
             return reply.code(400).send({
                 success: false,
-                error: 'Unsupported platform'
+                error: 'Unsupported platform. Supported: YouTube, Instagram, Twitter/X'
             });
+        }
+
+        if (!result.filename) {
+            const inferredName = buildDownloadFilename(downloadsDir, result.title || 'download', result.quality, type === 'audio' ? 'm4a' : 'mp4');
+            const inferredPath = path.join(downloadsDir, inferredName);
+            const originalPath = path.join(downloadsDir, result.downloadUrl.replace('/downloads/', ''));
+            if (fs.existsSync(originalPath)) {
+                fs.renameSync(originalPath, inferredPath);
+                result.filename = inferredName;
+                result.downloadUrl = `/downloads/${inferredName}`;
+            } else {
+                result.filename = inferredName;
+            }
         }
 
         return reply.send(result);
     } catch (error: unknown) {
         console.error('Download error:', error);
-        if (isDownloadError(error)) {
-            return reply.code(500).send({
-                success: false,
-                error: error.message || 'Unknown error occurred',
-                filename: error.filename
-            });
-        }
+        
+        // ✅ Return consistent error format
+        const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
+        console.error('Error details:', errorMessage);
+        
         return reply.code(500).send({
             success: false,
-            error: error instanceof Error ? error.message : 'Unknown error occurred'
+            error: errorMessage,
+            ...(isDownloadError(error) && error.filename ? { filename: error.filename } : {})
         });
     }
 });
@@ -450,14 +686,18 @@ app.get('/downloads/:filename', async (request, reply) => {
         const filepath = path.join(downloadsDir, filename);
 
         if (!fs.existsSync(filepath)) {
-            return reply.code(404).send({ success: false, message: 'File not found' });
+            console.error('❌ File not found:', filepath);
+            return reply.code(404).send({ success: false, error: 'File not found' });
         }
 
         const stats = fs.statSync(filepath);
         if (stats.size < 1000) {
-            return reply.code(500).send({ success: false, message: 'File is too small, download may have failed' });
+            console.error('❌ File too small:', stats.size, 'bytes');
+            return reply.code(500).send({ success: false, error: 'File is too small, download may have failed' });
         }
 
+        console.log('✅ Serving file:', filename, 'Size:', stats.size, 'bytes');
+        
         // Set headers
         reply.header('Content-Disposition', `attachment; filename="${filename}"`);
         reply.header('Content-Type', filename.endsWith('.mp4') ? 'video/mp4' : 'audio/mp4');
@@ -468,16 +708,15 @@ app.get('/downloads/:filename', async (request, reply) => {
         const stream = fs.createReadStream(filepath);
         return reply.send(stream);
     } catch (error) {
-        console.error('Error serving file:', error);
+        console.error('❌ Error serving file:', error);
         return reply.code(500).send({
             success: false,
-            message: 'Error serving file: ' + (error instanceof Error ? error.message : 'Unknown error')
+            error: 'Error serving file: ' + (error instanceof Error ? error.message : 'Unknown error')
         });
     }
 });
 
-// Info route to get video information
-app.get('/api/info', async (request: FastifyRequest<{ Querystring: { url: string } }>, reply: FastifyReply) => {
+const infoHandler = async (request: FastifyRequest<{ Querystring: { url: string } }>, reply: FastifyReply) => {
     try {
         const { url } = request.query;
         if (!url) {
@@ -488,14 +727,43 @@ app.get('/api/info', async (request: FastifyRequest<{ Querystring: { url: string
         }
 
         let info: any = {};
-        if (isYouTubeURL(url)) {
-            // Use yt-dlp to get video info
+        if (isYouTubeUrl(url)) {
             const command = `yt-dlp "${url}" --dump-json --no-warnings`;
             console.log(`Executing info command: ${command}`);
 
             try {
                 const { stdout: infoJson } = await execAsync(command);
                 const videoInfo = JSON.parse(infoJson);
+
+                const extractHeightValue = (label: string): number => {
+                    const match = label.match(/\d+/);
+                    return match ? parseInt(match[0], 10) : -1;
+                };
+
+                const qualityCandidates = (videoInfo.formats || [])
+                    .filter((format: any) => format?.vcodec && format.vcodec !== 'none')
+                    .map((format: any) => {
+                        if (typeof format.height === 'number' && format.height > 0) {
+                            return `${format.height}p`;
+                        }
+                        if (typeof format.format_note === 'string' && format.format_note.trim()) {
+                            return format.format_note.trim();
+                        }
+                        if (typeof format.resolution === 'string' && format.resolution.trim()) {
+                            return format.resolution.trim();
+                        }
+                        return null;
+                    })
+                    .filter((label: string | null): label is string => Boolean(label))
+                    .map((label: string) => {
+                        const numeric = extractHeightValue(label);
+                        return numeric > 0 ? `${numeric}p` : label;
+                    });
+
+                const videoQualities = Array.from(new Set<string>(qualityCandidates)).sort((a: string, b: string) => {
+                    const heightDiff = extractHeightValue(b) - extractHeightValue(a);
+                    return heightDiff !== 0 ? heightDiff : b.localeCompare(a);
+                });
 
                 info = {
                     title: videoInfo.title,
@@ -509,14 +777,14 @@ app.get('/api/info', async (request: FastifyRequest<{ Querystring: { url: string
                         hasVideo: format.vcodec !== 'none',
                         container: format.ext,
                         contentLength: format.filesize,
-                    }))
+                    })),
+                    qualities: videoQualities,
                 };
             } catch (error) {
                 console.error('Error getting video info:', error);
                 throw new Error('Could not get video information. The video might be private or restricted.');
             }
         } else if (url.includes('instagram.com')) {
-            // Instagram info will be fetched during download
             info = {
                 title: 'Instagram Post',
                 duration: 'N/A',
@@ -525,7 +793,6 @@ app.get('/api/info', async (request: FastifyRequest<{ Querystring: { url: string
                 formats: []
             };
         } else if (url.includes('twitter.com') || url.includes('x.com')) {
-            // Twitter info will be fetched during download
             info = {
                 title: 'Twitter Post',
                 duration: 'N/A',
@@ -551,7 +818,10 @@ app.get('/api/info', async (request: FastifyRequest<{ Querystring: { url: string
             error: error instanceof Error ? error.message : 'Unknown error occurred'
         });
     }
-});
+};
+
+app.get('/api/info', infoHandler);
+app.get('/api/media/info', infoHandler);
 
 // Add root route handler
 app.get('/', async (request, reply) => {
@@ -566,8 +836,10 @@ app.get('/health', async () => {
 // Start server
 const start = async () => {
     try {
-        await app.listen({ port: 2500, host: '0.0.0.0' });
-        console.log('Server is running on port 2500');
+        const port = Number(process.env.PORT ?? 2500);
+        const host = process.env.HOST ?? '0.0.0.0';
+        await app.listen({ port, host });
+        console.log(`Server is running on ${host}:${port}`);
     } catch (err) {
         app.log.error(err);
         process.exit(1);
@@ -576,15 +848,16 @@ const start = async () => {
 
 // Handle uncaught exceptions
 process.on('uncaughtException', (err) => {
-    app.log.error('Uncaught Exception:', err);
+    app.log.error({ err }, 'Uncaught Exception');
     process.exit(1);
 });
 
 // Handle unhandled promise rejections
 process.on('unhandledRejection', (err) => {
-    app.log.error('Unhandled Rejection:', err);
+    app.log.error({ err }, 'Unhandled Rejection');
     process.exit(1);
 });
 
-start();
-
+if (process.env.NODE_ENV !== 'test') {
+    start();
+}
