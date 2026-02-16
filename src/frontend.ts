@@ -1,24 +1,19 @@
-import express, { type Request, type Response } from 'express';
+import express from 'express';
 import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
 
-// Serve static files from the public directory
 app.use(express.static(path.join(__dirname, '../public')));
 
-// Serve the main HTML file
-app.get('/', (req: Request, res: Response) => {
+app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, '../public/index.html'));
 });
 
-// Start the server
-const PORT = 8081;
-const PORT1 = 8082;
-// const PORT = 2000;
-// const PORT = 2100;
+const PORT = Number(process.env.FRONTEND_PORT || 8081);
 app.listen(PORT, () => {
-    console.log(`Frontend server running on http://localhost:${PORT}`);
-}); 
-app.listen(PORT1, () => {
-    console.log(`Frontend server running on http://localhost:${PORT1}`);
-}); 
+    console.log(`Frontend server running on port ${PORT}`);
+});

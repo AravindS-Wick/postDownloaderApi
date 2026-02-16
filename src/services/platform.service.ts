@@ -1,6 +1,35 @@
+import crypto from 'crypto';
 import type { FastifyInstance } from 'fastify';
-import type { PlatformAuthConfig, PlatformAuthResponse, SocialPlatform } from '../types/auth.types.js';
+import type { PlatformAuthConfig, PlatformAuthResponse } from '../types/auth.types.js';
 import axios from 'axios';
+
+// In-memory store for OAuth state and PKCE verifiers
+const oauthStateStore = new Map<string, { codeVerifier?: string; createdAt: number }>();
+
+// Clean up expired states (older than 10 minutes)
+function cleanExpiredStates() {
+    const tenMinutesAgo = Date.now() - 10 * 60 * 1000;
+    for (const [key, value] of oauthStateStore) {
+        if (value.createdAt < tenMinutesAgo) {
+            oauthStateStore.delete(key);
+        }
+    }
+}
+
+const VALID_PLATFORMS = ['instagram', 'youtube', 'twitter', 'tiktok'];
+
+export function isValidPlatform(platform: string): boolean {
+    return VALID_PLATFORMS.includes(platform.toLowerCase());
+}
+
+export function validateOAuthState(state: string): { valid: boolean; codeVerifier?: string } {
+    const entry = oauthStateStore.get(state);
+    if (!entry) {
+        return { valid: false };
+    }
+    oauthStateStore.delete(state);
+    return { valid: true, codeVerifier: entry.codeVerifier };
+}
 
 export class PlatformService {
     private fastify: FastifyInstance;
@@ -10,46 +39,72 @@ export class PlatformService {
     }
 
     async getInstagramAuthUrl(config: PlatformAuthConfig): Promise<string> {
+        const state = this.generateState();
+        oauthStateStore.set(state, { createdAt: Date.now() });
+        cleanExpiredStates();
+
         const params = new URLSearchParams({
             client_id: config.clientId,
             redirect_uri: config.redirectUri,
             scope: config.scope.join(' '),
-            response_type: 'code'
+            response_type: 'code',
+            state
         });
         return `https://api.instagram.com/oauth/authorize?${params.toString()}`;
     }
 
     async getYouTubeAuthUrl(config: PlatformAuthConfig): Promise<string> {
+        const state = this.generateState();
+        oauthStateStore.set(state, { createdAt: Date.now() });
+        cleanExpiredStates();
+
         const params = new URLSearchParams({
             client_id: config.clientId,
             redirect_uri: config.redirectUri,
             scope: config.scope.join(' '),
             response_type: 'code',
             access_type: 'offline',
-            prompt: 'consent'
+            prompt: 'consent',
+            state
         });
         return `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
     }
 
     async getTikTokAuthUrl(config: PlatformAuthConfig): Promise<string> {
+        const state = this.generateState();
+        oauthStateStore.set(state, { createdAt: Date.now() });
+        cleanExpiredStates();
+
         const params = new URLSearchParams({
             client_key: config.clientId,
             redirect_uri: config.redirectUri,
             scope: config.scope.join(','),
             response_type: 'code',
-            state: this.generateState()
+            state
         });
         return `https://www.tiktok.com/auth/authorize/?${params.toString()}`;
     }
 
     async getTwitterAuthUrl(config: PlatformAuthConfig): Promise<string> {
+        // Generate PKCE code verifier and challenge
+        const codeVerifier = crypto.randomBytes(32).toString('base64url');
+        const codeChallenge = crypto
+            .createHash('sha256')
+            .update(codeVerifier)
+            .digest('base64url');
+
+        const state = this.generateState();
+        oauthStateStore.set(state, { codeVerifier, createdAt: Date.now() });
+        cleanExpiredStates();
+
         const params = new URLSearchParams({
             client_id: config.clientId,
             redirect_uri: config.redirectUri,
             scope: config.scope.join(' '),
             response_type: 'code',
             code_challenge_method: 'S256',
-            code_challenge: 'challenge' // TODO: Generate proper challenge
+            code_challenge: codeChallenge,
+            state
         });
         return `https://twitter.com/i/oauth2/authorize?${params.toString()}`;
     }
@@ -122,14 +177,14 @@ export class PlatformService {
         };
     }
 
-    async handleTwitterCallback(code: string, config: PlatformAuthConfig): Promise<PlatformAuthResponse> {
+    async handleTwitterCallback(code: string, config: PlatformAuthConfig, codeVerifier?: string): Promise<PlatformAuthResponse> {
         const params = new URLSearchParams({
             client_id: config.clientId,
             client_secret: config.clientSecret,
             grant_type: 'authorization_code',
             redirect_uri: config.redirectUri,
             code,
-            code_verifier: 'verifier' // TODO: Use proper verifier
+            code_verifier: codeVerifier || ''
         });
 
         const response = await fetch('https://api.twitter.com/2/oauth2/token', {
@@ -150,6 +205,6 @@ export class PlatformService {
     }
 
     private generateState(): string {
-        return Math.random().toString(36).substring(2, 15);
+        return crypto.randomBytes(32).toString('hex');
     }
-} 
+}

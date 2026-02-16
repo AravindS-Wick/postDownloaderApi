@@ -1,1 +1,8 @@
-[]
+[
+  {
+    "email": "test@example.com",
+    "password": "$2a$10$S3qnYmNNt2VjWdfOQRqE..QVjnZMppGMx2s4tqCiwDyrlCoDzk1La",
+    "created": 1770828470505,
+    "downloads": []
+  }
+]
