@@ -4,6 +4,8 @@ import path from 'path';
 export function sanitizeFilenameComponent(component: string): string {
     return component
         .replace(/[<>:"/\\|?*\x00-\x1F]/g, '')
+        .replace(/[&#+%{}^~`\[\]@!$;=]/g, '')
+        .replace(/[,.]/g, '')
         .replace(/\s+/g, ' ')
         .trim();
 }
