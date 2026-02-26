@@ -12,6 +12,5 @@ coverage/
 *.orig
 .zencoder
 /test-downloads/*
-package-lock.json
 /db/
 cookies.txt
