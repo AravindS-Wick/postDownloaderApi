@@ -5,12 +5,15 @@ import { isValidPlatform, validateOAuthState } from '../services/platform.servic
 import type { JwtPayload } from '../types/auth.types.js';
 import bcrypt from 'bcryptjs';
 import { getUser, createUser, userExists } from '../db/database.js';
+import { validatePasswordStrength } from '../utils/validation.js';
 
 export async function authRoutes(fastify: FastifyInstance) {
     const authService = createAuthService(fastify);
 
     // Register route (UI calls POST /api/auth/register)
-    fastify.post<{ Body: { email: string; password: string; username?: string } }>('/register', async (request, reply) => {
+    fastify.post<{ Body: { email: string; password: string; username?: string } }>('/register', {
+        config: { rateLimit: { max: 5, timeWindow: '1 minute' } }
+    }, async (request, reply) => {
         const { email, password } = request.body;
         if (!email || !password) {
             return reply.code(400).send({ success: false, message: 'Email and password required' });
@@ -18,8 +21,9 @@ export async function authRoutes(fastify: FastifyInstance) {
         if (typeof email !== 'string' || email.length > 255 || !email.includes('@')) {
             return reply.code(400).send({ success: false, message: 'Invalid email format' });
         }
-        if (typeof password !== 'string' || password.length < 6) {
-            return reply.code(400).send({ success: false, message: 'Password must be at least 6 characters' });
+        const pwCheck = validatePasswordStrength(password);
+        if (!pwCheck.valid) {
+            return reply.code(400).send({ success: false, message: pwCheck.error });
         }
         try {
             if (userExists(email)) {
@@ -35,14 +39,40 @@ export async function authRoutes(fastify: FastifyInstance) {
     });
 
     // Login route
-    fastify.post<{ Body: { email: string; password: string } }>('/login', async (request, reply) => {
+    fastify.post<{ Body: { email: string; password: string } }>('/login', {
+        config: { rateLimit: { max: 5, timeWindow: '1 minute' } }
+    }, async (request, reply) => {
         const { email, password } = request.body;
         try {
             const { token, user } = await authService.login(email, password);
             return { success: true, token, user };
         } catch (error) {
+            request.log.warn({
+                event: 'auth_failure',
+                email,
+                ip: request.ip,
+                timestamp: new Date().toISOString(),
+            }, 'Failed login attempt');
             reply.code(401);
             return { success: false, error: 'Invalid credentials' };
+        }
+    });
+
+    // Token refresh — issues a new JWT if current one is still valid
+    fastify.post('/refresh', async (request, reply) => {
+        try {
+            await request.jwtVerify();
+            const { userId, email } = request.user as JwtPayload;
+
+            const user = getUser(email);
+            if (!user) {
+                return reply.code(401).send({ success: false, error: 'User not found' });
+            }
+
+            const newToken = fastify.jwt.sign({ userId, email } as JwtPayload);
+            return { success: true, token: newToken };
+        } catch {
+            return reply.code(401).send({ success: false, error: 'Invalid or expired token' });
         }
     });
 

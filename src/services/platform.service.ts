@@ -1,7 +1,6 @@
 import crypto from 'crypto';
 import type { FastifyInstance } from 'fastify';
 import type { PlatformAuthConfig, PlatformAuthResponse } from '../types/auth.types.js';
-import axios from 'axios';
 
 // In-memory store for OAuth state and PKCE verifiers
 const oauthStateStore = new Map<string, { codeVerifier?: string; createdAt: number }>();
@@ -169,11 +168,20 @@ export class PlatformService {
             code
         });
 
-        const response = await axios.post('https://open-api.tiktok.com/oauth/access_token/', params);
+        const response = await fetch('https://open-api.tiktok.com/oauth/access_token/', {
+            method: 'POST',
+            body: params
+        });
+
+        if (!response.ok) {
+            throw new Error('Failed to get TikTok access token');
+        }
+
+        const data = await response.json();
         return {
-            accessToken: response.data.access_token,
-            refreshToken: response.data.refresh_token,
-            expiresIn: response.data.expires_in
+            accessToken: data.access_token,
+            refreshToken: data.refresh_token,
+            expiresIn: data.expires_in
         };
     }
 

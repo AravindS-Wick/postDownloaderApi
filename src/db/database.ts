@@ -4,7 +4,14 @@ import { fileURLToPath } from 'url';
 
 const __filename_db = fileURLToPath(import.meta.url);
 const __dirname_db = path.dirname(__filename_db);
-const DB_PATH = path.join(__dirname_db, '../../db/app.db');
+// Use DATA_DIR env var when deployed (e.g. Fly.io persistent volume at /data)
+// Falls back to the local db/ directory for development
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname_db, '../..');
+const DB_PATH = path.join(DATA_DIR, 'db', 'app.db');
+
+// Ensure the db directory exists
+import fs from 'fs';
+fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
 
 const db = new Database(DB_PATH);
 
@@ -31,6 +38,14 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_downloads_user_email ON downloads(user_email);
   CREATE INDEX IF NOT EXISTS idx_downloads_created_at ON downloads(created_at DESC);
+
+  CREATE TABLE IF NOT EXISTS guest_downloads (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ip TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_guest_downloads_ip ON guest_downloads(ip);
 `);
 
 // --- User helpers ---
@@ -108,6 +123,24 @@ export function getGuestDownloads(limit = 1000): DbDownload[] {
 
 export function deleteUserDownloads(email: string): void {
   stmtDeleteUserDownloads.run(email);
+}
+
+// --- Guest download helpers (freemium tracking) ---
+
+const stmtCountGuestDownloads = db.prepare(
+  'SELECT COUNT(*) AS count FROM guest_downloads WHERE ip = ?'
+);
+const stmtLogGuestDownload = db.prepare(
+  'INSERT INTO guest_downloads (ip, created_at) VALUES (?, ?)'
+);
+
+export function getGuestDownloadCount(ip: string): number {
+  const row = stmtCountGuestDownloads.get(ip) as { count: number } | undefined;
+  return row?.count ?? 0;
+}
+
+export function logGuestDownload(ip: string): void {
+  stmtLogGuestDownload.run(ip, Date.now());
 }
 
 // Graceful shutdown

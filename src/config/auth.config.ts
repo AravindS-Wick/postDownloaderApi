@@ -1,4 +1,5 @@
 import type { AuthConfig } from '../types/auth.types.js';
+import crypto from 'crypto';
 
 const isDev = process.env.NODE_ENV !== 'production';
 
@@ -6,8 +7,13 @@ if (!process.env.JWT_SECRET && !isDev) {
     throw new Error('FATAL: JWT_SECRET environment variable is required in production');
 }
 
+const generatedDevSecret = crypto.randomBytes(64).toString('hex');
+if (!process.env.JWT_SECRET && isDev) {
+    console.warn('WARNING: No JWT_SECRET set — using a random secret for this process. Tokens will not persist across restarts.');
+}
+
 export const authConfig: AuthConfig = {
-    jwtSecret: process.env.JWT_SECRET || (isDev ? 'dev-only-insecure-secret' : ''),
+    jwtSecret: process.env.JWT_SECRET || (isDev ? generatedDevSecret : ''),
     jwtExpiresIn: '24h',
     platforms: {
         instagram: {

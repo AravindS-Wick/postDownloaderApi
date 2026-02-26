@@ -1,0 +1,8 @@
+node_modules/
+src/
+downloads/
+db/
+*.log
+.env
+cookies.txt
+.git/
