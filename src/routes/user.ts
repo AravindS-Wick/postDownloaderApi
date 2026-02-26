@@ -1,6 +1,7 @@
 import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import bcrypt from 'bcryptjs';
 import { getUser, createUser, userExists, logDownload, getUserDownloads } from '../db/database.js';
+import { validatePasswordStrength, VALID_DOWNLOAD_TYPES, VALID_LOG_STATUSES, MAX_META_SIZE } from '../utils/validation.js';
 
 interface SignupRequest {
     email: string;
@@ -17,7 +18,9 @@ interface LogRequest {
 
 export default async function userRoutes(fastify: FastifyInstance) {
     // Signup
-    fastify.post<{ Body: SignupRequest }>('/signup', async (request: FastifyRequest<{ Body: SignupRequest }>, reply: FastifyReply) => {
+    fastify.post<{ Body: SignupRequest }>('/signup', {
+        config: { rateLimit: { max: 5, timeWindow: '1 minute' } }
+    }, async (request: FastifyRequest<{ Body: SignupRequest }>, reply: FastifyReply) => {
         const { email, password } = request.body;
         if (!email || !password) {
             return reply.code(400).send({ message: 'Email and password required' });
@@ -27,8 +30,9 @@ export default async function userRoutes(fastify: FastifyInstance) {
             return reply.code(400).send({ message: 'Invalid email format' });
         }
 
-        if (typeof password !== 'string' || password.length < 6) {
-            return reply.code(400).send({ message: 'Password must be at least 6 characters' });
+        const pwCheck = validatePasswordStrength(password);
+        if (!pwCheck.valid) {
+            return reply.code(400).send({ message: pwCheck.error });
         }
 
         try {
@@ -45,31 +49,21 @@ export default async function userRoutes(fastify: FastifyInstance) {
         }
     });
 
-    // Get profile — supports JWT auth header OR ?email= query param
-    fastify.get('/profile', async (request: FastifyRequest<{ Querystring: { email?: string } }>, reply: FastifyReply) => {
-        let email = request.query.email;
-
-        // If no email query param, try JWT auth
-        if (!email) {
-            try {
-                await request.jwtVerify();
-                const payload = request.user as { userId: string; email: string };
-                email = payload.email;
-            } catch {
-                return reply.code(401).send({ message: 'Email query param or Authorization header required' });
-            }
-        }
-
+    // Get profile — requires JWT auth
+    fastify.get('/profile', async (request: FastifyRequest, reply: FastifyReply) => {
         try {
-            const user = getUser(email!);
+            await request.jwtVerify();
+            const payload = request.user as { userId: string; email: string };
+            const email = payload.email;
+
+            const user = getUser(email);
             if (!user) {
                 return reply.code(404).send({ message: 'User not found' });
             }
             const downloads = getUserDownloads(user.email);
             reply.send({ email: user.email, created: user.created_at, downloads });
-        } catch (error) {
-            console.error('Profile error:', error);
-            return reply.code(500).send({ message: 'Internal server error' });
+        } catch {
+            return reply.code(401).send({ message: 'Authentication required' });
         }
     });
 
@@ -77,6 +71,16 @@ export default async function userRoutes(fastify: FastifyInstance) {
     fastify.post<{ Body: LogRequest }>('/log', async (request: FastifyRequest<{ Body: LogRequest }>, reply: FastifyReply) => {
         try {
             const { email, type, status, meta, ageConsent } = request.body;
+
+            if (!type || !(VALID_DOWNLOAD_TYPES as readonly string[]).includes(type)) {
+                return reply.code(400).send({ message: `Invalid type. Must be one of: ${VALID_DOWNLOAD_TYPES.join(', ')}` });
+            }
+            if (!status || !(VALID_LOG_STATUSES as readonly string[]).includes(status)) {
+                return reply.code(400).send({ message: `Invalid status. Must be one of: ${VALID_LOG_STATUSES.join(', ')}` });
+            }
+            if (meta && typeof meta === 'object' && JSON.stringify(meta).length > MAX_META_SIZE) {
+                return reply.code(400).send({ message: 'Meta data too large' });
+            }
 
             logDownload({
                 userEmail: email || null,

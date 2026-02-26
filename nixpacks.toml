@@ -1,0 +1,18 @@
+# Nixpacks config for Railway deployment
+# Installs system dependencies needed by the API
+
+[phases.setup]
+nixPkgs = ["nodejs_22", "ffmpeg", "python312", "curl"]
+
+[phases.install]
+cmds = [
+  "npm install --omit=dev",
+  "npm rebuild better-sqlite3",
+  "curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp && chmod a+rx /usr/local/bin/yt-dlp"
+]
+
+[phases.build]
+cmds = ["npm run build"]
+
+[start]
+cmd = "node dist/index.js"

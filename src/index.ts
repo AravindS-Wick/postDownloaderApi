@@ -13,13 +13,15 @@ import jwt from '@fastify/jwt';
 import { fileURLToPath } from 'url';
 import fastifyStatic from '@fastify/static';
 import rateLimit from '@fastify/rate-limit';
-import { closeDatabase } from './db/database.js';
+import { closeDatabase, getGuestDownloadCount, logGuestDownload } from './db/database.js';
 import {
     buildDownloadFilename,
     isYouTubeUrl,
     normalizeYouTubeUrl,
 } from './utils/download-utils.js';
 import userRoutes from './routes/user.js';
+import { getInstagramUserPosts } from './services/instagram.service.js';
+import { getTwitterUserPosts } from './services/twitter.service.js';
 
 dotenv.config();
 
@@ -44,6 +46,32 @@ const YTDLP_TIMEOUT_MS = 300_000; // 5 minutes
 const YTDLP_MAX_BUFFER = 10 * 1024 * 1024; // 10MB
 const CLEANUP_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
 const CLEANUP_MAX_AGE_MS = 60 * 60 * 1000; // 1 hour
+
+// Cookie support — allows yt-dlp to access login-restricted content (age-gated, private, etc.)
+// Set COOKIES_FROM_BROWSER=chrome (or firefox, edge, safari) to auto-extract from local browser
+// Or set COOKIES_FILE=/path/to/cookies.txt for a Netscape-format cookie file
+const COOKIES_FROM_BROWSER = process.env.COOKIES_FROM_BROWSER || '';
+// Resolve cookies file path — supports absolute paths and paths relative to cwd
+const _rawCookiesFile = process.env.COOKIES_FILE || '';
+const COOKIES_FILE = _rawCookiesFile
+    ? path.isAbsolute(_rawCookiesFile)
+        ? _rawCookiesFile
+        : path.resolve(process.cwd(), _rawCookiesFile)
+    : '';
+
+function getYtdlpCookieArgs(): string[] {
+    if (COOKIES_FROM_BROWSER) {
+        return ['--cookies-from-browser', COOKIES_FROM_BROWSER];
+    }
+    if (COOKIES_FILE && fs.existsSync(COOKIES_FILE)) {
+        return ['--cookies', COOKIES_FILE];
+    }
+    return [];
+}
+
+// Freemium config — set FREEMIUM_ENABLED=true in .env to gate downloads after the limit
+const FREEMIUM_ENABLED = process.env.FREEMIUM_ENABLED === 'true';
+const FREEMIUM_LIMIT = Number(process.env.FREEMIUM_LIMIT) || 10;
 
 const app = fastify({
     logger: {
@@ -123,14 +151,18 @@ app.register(swaggerUi, {
     routePrefix: '/documentation'
 });
 
+// Use DATA_DIR env var when deployed (e.g. Fly.io persistent volume at /data)
+// Falls back to project root for local development
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..');
+
 // Create downloads directory if it doesn't exist
-const downloadsDir = path.join(__dirname, '..', 'downloads');
+const downloadsDir = path.join(DATA_DIR, 'downloads');
 if (!fs.existsSync(downloadsDir)) {
     fs.mkdirSync(downloadsDir, { recursive: true });
 }
 
-// Create db directory if it doesn't exist
-const dbDir = path.join(__dirname, '..', 'db');
+// Create db directory if it doesn't exist (also handled in database.ts)
+const dbDir = path.join(DATA_DIR, 'db');
 if (!fs.existsSync(dbDir)) {
     fs.mkdirSync(dbDir, { recursive: true });
 }
@@ -268,7 +300,13 @@ function parseYtdlpError(stderr: string, platform: string): string {
         return 'This video is private. The owner has not made it publicly available';
     }
     if (lower.includes('sign in to confirm your age') || lower.includes('age-restricted')) {
-        return 'This video is age-restricted and cannot be downloaded';
+        return 'This video is age-restricted. Set COOKIES_FROM_BROWSER in .env to access restricted content';
+    }
+    if (lower.includes('inappropriate') || lower.includes('unavailable for certain audiences')) {
+        return 'This content is restricted by the platform. Set COOKIES_FROM_BROWSER in .env to access it';
+    }
+    if (lower.includes('no video could be found') || lower.includes('no video in this tweet') || lower.includes('no formats found')) {
+        return 'No video found in this post. This may be a text or image-only post';
     }
     if (lower.includes('unsupported url')) {
         return 'This URL is not supported for downloading';
@@ -533,7 +571,7 @@ async function downloadMedia(
         let videoInfo: any = null;
         try {
             const { stdout: infoJson } = await execFileAsync('yt-dlp', [
-                cleanUrl, '--dump-json', '--no-warnings'
+                cleanUrl, '--dump-json', '--no-warnings', ...getYtdlpCookieArgs()
             ], { timeout: YTDLP_TIMEOUT_MS, maxBuffer: YTDLP_MAX_BUFFER });
             videoInfo = JSON.parse(infoJson);
             console.log(`${platform} info retrieved successfully`);
@@ -563,6 +601,7 @@ async function downloadMedia(
             '--no-warnings',
             '--progress',
             '--newline',
+            ...getYtdlpCookieArgs(),
         ];
 
         // For video with adaptive formats (video+audio merge), ensure mp4 output
@@ -689,6 +728,27 @@ async function downloadMedia(
 
 // Download route
 app.post('/api/download', {
+    preHandler: async (request, reply) => {
+        if (!FREEMIUM_ENABLED) return; // all downloads free when disabled
+
+        // Authenticated users bypass the guest limit
+        try {
+            await request.jwtVerify();
+            return; // valid JWT — allow
+        } catch {
+            // No valid JWT — check guest limit
+        }
+
+        const count = getGuestDownloadCount(request.ip);
+        if (count >= FREEMIUM_LIMIT) {
+            return reply.code(403).send({
+                success: false,
+                error: 'Free download limit reached. Please sign up to continue.',
+                requiresAuth: true,
+                downloadsUsed: count,
+            });
+        }
+    },
     config: {
         rateLimit: {
             max: 10,
@@ -728,12 +788,32 @@ app.post('/api/download', {
         }
 
         const result = await downloadMedia(url, type, platform, downloadOptions);
+
+        // Track guest download for freemium limiting
+        if (FREEMIUM_ENABLED) {
+            let isGuest = true;
+            try {
+                await request.jwtVerify();
+                isGuest = false;
+            } catch { /* no valid JWT — guest user */ }
+            if (isGuest) {
+                logGuestDownload(request.ip);
+            }
+        }
+
         return reply.send(result);
     } catch (error: unknown) {
         console.error('Download error:', error);
-        return reply.code(500).send({
+        const msg = clientErrorMessage(error);
+        // User-facing errors (bad URL, no video, private, etc.) → 422; unexpected → 500
+        const isUserError = [
+            'No video found', 'unavailable', 'private', 'age-restrict',
+            'restricted', 'not supported', 'timed out', 'too small',
+            'not found', 'Failed to download'
+        ].some(k => msg.toLowerCase().includes(k.toLowerCase()));
+        return reply.code(isUserError ? 422 : 500).send({
             success: false,
-            error: clientErrorMessage(error),
+            error: msg,
             ...(isDownloadError(error) && error.filename ? { filename: error.filename } : {})
         });
     }
@@ -766,7 +846,7 @@ const infoHandler = async (request: FastifyRequest<{ Querystring: { url: string 
         let videoInfo: any;
         try {
             const { stdout: infoJson } = await execFileAsync('yt-dlp', [
-                cleanUrl, '--dump-json', '--no-warnings'
+                cleanUrl, '--dump-json', '--no-warnings', ...getYtdlpCookieArgs()
             ], { timeout: YTDLP_TIMEOUT_MS, maxBuffer: YTDLP_MAX_BUFFER });
             videoInfo = JSON.parse(infoJson);
         } catch (infoError: any) {
@@ -826,7 +906,12 @@ const infoHandler = async (request: FastifyRequest<{ Querystring: { url: string 
         return reply.send({ success: true, ...info });
     } catch (error) {
         console.error('Info error:', error);
-        return reply.code(500).send({ success: false, error: clientErrorMessage(error) });
+        const msg = clientErrorMessage(error);
+        const isUserError = [
+            'No video found', 'unavailable', 'private', 'age-restrict',
+            'restricted', 'not supported', 'timed out', 'Failed to download'
+        ].some(k => msg.toLowerCase().includes(k.toLowerCase()));
+        return reply.code(isUserError ? 422 : 500).send({ success: false, error: msg });
     }
 };
 
@@ -841,6 +926,200 @@ app.get('/api/media/status/:downloadId', async (request, reply) => {
         downloadId,
         status: 'completed',
         progress: 100,
+    });
+});
+
+// Channel posts endpoint — fetch creator posts with pagination (12 per page)
+app.post('/api/channel-posts', {
+    config: {
+        rateLimit: { max: 10, timeWindow: '1 minute' }
+    }
+}, async (request: FastifyRequest<{ Body: { url: string; page?: number } }>, reply: FastifyReply) => {
+    try {
+        const { url, page = 1 } = request.body;
+        const PAGE_SIZE = 12;
+
+        const urlValidation = validateUrl(url);
+        if (!urlValidation.valid) {
+            return reply.code(400).send({ success: false, error: urlValidation.error });
+        }
+
+        const isYT = isYouTubeUrl(url);
+        const isInsta = url.includes('instagram.com');
+        const isTwitter = url.includes('twitter.com') || url.includes('x.com');
+        const isTikTok = url.includes('tiktok.com');
+        const isFacebook = url.includes('facebook.com') || url.includes('fb.com');
+
+        // Determine platform name for URLs
+        const platformName = isYT ? 'YouTube' : isInsta ? 'Instagram' : isTwitter ? 'Twitter/X' : isTikTok ? 'TikTok' : isFacebook ? 'Facebook' : 'Unknown';
+
+        // Instagram — uses mobile API (no auth required)
+        if (isInsta) {
+            let profileUrl = url;
+
+            // If given a reel/post URL (not a profile URL), resolve the uploader's profile via yt-dlp
+            const isReelOrPost = /instagram\.com\/(reel|p|tv)\//.test(url);
+            if (isReelOrPost) {
+                try {
+                    // yt-dlp returns 'NA' for uploader_url on Instagram; use 'channel' field instead
+                    const { stdout: channelLine } = await execFileAsync('yt-dlp', [
+                        url.split('?')[0], // strip query params
+                        '--print', 'channel',
+                        '--no-warnings',
+                        '--no-download',
+                        '--playlist-items', '1',
+                        ...getYtdlpCookieArgs(),
+                    ], { timeout: 30_000, maxBuffer: 1024 * 1024 });
+                    const username = channelLine.trim().toLowerCase();
+                    if (username && username !== 'na' && username !== 'none') {
+                        profileUrl = `https://www.instagram.com/${username}`;
+                    }
+                } catch {
+                    // Fall through to using original URL (will fail gracefully in getInstagramUserPosts)
+                }
+            }
+
+            const result = await getInstagramUserPosts(profileUrl, page, PAGE_SIZE);
+            if (result.error) {
+                return reply.send({ success: true, posts: [], hasMore: false, comingSoon: false, message: result.error });
+            }
+            return reply.send({ success: true, posts: result.posts, hasMore: result.hasMore, comingSoon: false });
+        }
+
+        // Twitter/X — uses syndication API (no auth required)
+        if (isTwitter) {
+            const result = await getTwitterUserPosts(url, page, PAGE_SIZE);
+            if (result.error) {
+                return reply.send({ success: true, posts: [], hasMore: false, comingSoon: false, message: result.error });
+            }
+            return reply.send({ success: true, posts: result.posts, hasMore: result.hasMore, comingSoon: false });
+        }
+
+        // TikTok, Facebook: batch not yet supported
+        if (!isYT) {
+            return reply.send({
+                success: true,
+                posts: [],
+                hasMore: false,
+                comingSoon: true,
+                message: `Batch downloads from ${platformName} are coming soon. Individual downloads still work!`,
+            });
+        }
+
+        // Calculate playlist item range for pagination
+        const startItem = (page - 1) * PAGE_SIZE + 1;
+        const endItem = page * PAGE_SIZE;
+        // Fetch one extra to know if there's a next page
+        const fetchEnd = endItem + 1;
+
+        // YouTube only from here — resolve channel URL via yt-dlp
+        // Use --print to extract only channel_url (avoids massive --dump-json output)
+        let creatorUrl: string;
+        try {
+            const normalizedUrl = normalizeYouTubeUrl(url);
+
+            // If URL is already a channel/user URL, use it directly
+            if (/youtube\.com\/(channel|c|user|@)/.test(normalizedUrl)) {
+                creatorUrl = normalizedUrl.replace(/\/$/, '') + '/videos';
+            } else {
+                // It's a video URL — extract channel_url with lightweight --print
+                const { stdout: channelUrl } = await execFileAsync('yt-dlp', [
+                    normalizedUrl, '--print', 'channel_url', '--no-warnings', '--no-download', '--playlist-items', '1',
+                    ...getYtdlpCookieArgs(),
+                ], { timeout: YTDLP_TIMEOUT_MS, maxBuffer: 1024 * 1024 });
+
+                creatorUrl = channelUrl.trim();
+                if (creatorUrl) {
+                    creatorUrl = creatorUrl.replace(/\/$/, '') + '/videos';
+                }
+            }
+
+            if (!creatorUrl) {
+                return reply.send({ success: true, posts: [], hasMore: false, comingSoon: false });
+            }
+        } catch (err) {
+            console.error('Failed to resolve YouTube channel URL:', err);
+            return reply.send({ success: true, posts: [], hasMore: false, comingSoon: false });
+        }
+
+        // Step 2: Fetch posts from the creator's page with pagination
+        // Try /videos first; if channel has no videos tab (e.g. Shorts-only), fall back to /shorts
+        const ytdlpPlaylistArgs = [
+            '--flat-playlist',
+            '--dump-json',
+            '--no-warnings',
+            '--playlist-items', `${startItem}:${fetchEnd}`,
+            ...getYtdlpCookieArgs(),
+        ];
+
+        let stdout: string;
+        try {
+            ({ stdout } = await execFileAsync('yt-dlp', [creatorUrl, ...ytdlpPlaylistArgs], {
+                timeout: YTDLP_TIMEOUT_MS,
+                maxBuffer: YTDLP_MAX_BUFFER,
+            }));
+        } catch (err: any) {
+            const errMsg = (err?.stderr || err?.message || '').toLowerCase();
+            if (errMsg.includes('does not have a videos tab') || errMsg.includes('no videos')) {
+                // Retry with /shorts tab
+                const shortsUrl = creatorUrl.replace(/\/videos$/, '/shorts');
+                ({ stdout } = await execFileAsync('yt-dlp', [shortsUrl, ...ytdlpPlaylistArgs], {
+                    timeout: YTDLP_TIMEOUT_MS,
+                    maxBuffer: YTDLP_MAX_BUFFER,
+                }));
+            } else {
+                throw err;
+            }
+        }
+
+        const allParsed = stdout
+            .trim()
+            .split('\n')
+            .filter(Boolean)
+            .map((line: string) => {
+                try {
+                    const entry = JSON.parse(line);
+                    const entryId = entry.id || '';
+
+                    // Build YouTube URL if not already a full URL
+                    let postUrl = entry.url || entry.webpage_url || '';
+                    if (!postUrl.startsWith('http')) {
+                        postUrl = `https://www.youtube.com/watch?v=${entryId}`;
+                    }
+
+                    return {
+                        id: entryId,
+                        title: entry.title || 'Untitled',
+                        thumbnail: entry.thumbnail || entry.thumbnails?.[0]?.url || '',
+                        duration: entry.duration || null,
+                        url: postUrl,
+                        platform: platformName,
+                    };
+                } catch {
+                    return null;
+                }
+            })
+            .filter(Boolean);
+
+        // Check if there are more pages
+        const hasMore = allParsed.length > PAGE_SIZE;
+        const posts = allParsed.slice(0, PAGE_SIZE);
+
+        return reply.send({ success: true, posts, hasMore, comingSoon: false });
+    } catch (error) {
+        console.error('Channel posts error:', error);
+        return reply.code(500).send({ success: false, error: clientErrorMessage(error) });
+    }
+});
+
+// Guest remaining downloads endpoint
+app.get('/api/downloads/remaining', async (request, reply) => {
+    const used = getGuestDownloadCount(request.ip);
+    return reply.send({
+        freemiumEnabled: FREEMIUM_ENABLED,
+        total: FREEMIUM_LIMIT,
+        used,
+        remaining: Math.max(0, FREEMIUM_LIMIT - used),
     });
 });
 
