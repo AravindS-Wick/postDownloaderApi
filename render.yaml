@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: social-post-downloader-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    region: singapore
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 2500
+      - key: FREEMIUM_ENABLED
+        value: false
+      - key: DATA_DIR
+        value: /tmp
+      - key: JWT_SECRET
+        generateValue: true
