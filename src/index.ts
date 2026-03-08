@@ -48,16 +48,24 @@ const CLEANUP_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
 const CLEANUP_MAX_AGE_MS = 60 * 60 * 1000; // 1 hour
 
 // Cookie support — allows yt-dlp to access login-restricted content (age-gated, private, etc.)
-// Set COOKIES_FROM_BROWSER=chrome (or firefox, edge, safari) to auto-extract from local browser
-// Or set COOKIES_FILE=/path/to/cookies.txt for a Netscape-format cookie file
+// Option 1: COOKIES_FROM_BROWSER=chrome  (local dev only — browser must be on same machine)
+// Option 2: COOKIES_FILE=/path/to/cookies.txt  (Netscape-format file)
+// Option 3: COOKIES_CONTENT=<full contents of cookies.txt>  (for Railway/cloud deployments)
 const COOKIES_FROM_BROWSER = process.env.COOKIES_FROM_BROWSER || '';
-// Resolve cookies file path — supports absolute paths and paths relative to cwd
+
+// If COOKIES_CONTENT env var is set (cloud deployment), write it to a temp file once at startup
+let COOKIES_FILE = '';
 const _rawCookiesFile = process.env.COOKIES_FILE || '';
-const COOKIES_FILE = _rawCookiesFile
-    ? path.isAbsolute(_rawCookiesFile)
+if (process.env.COOKIES_CONTENT) {
+    const tmpCookiesPath = path.join('/tmp', 'cookies.txt');
+    fs.writeFileSync(tmpCookiesPath, process.env.COOKIES_CONTENT, 'utf8');
+    COOKIES_FILE = tmpCookiesPath;
+    console.log('Cookies loaded from COOKIES_CONTENT env var →', tmpCookiesPath);
+} else if (_rawCookiesFile) {
+    COOKIES_FILE = path.isAbsolute(_rawCookiesFile)
         ? _rawCookiesFile
-        : path.resolve(process.cwd(), _rawCookiesFile)
-    : '';
+        : path.resolve(process.cwd(), _rawCookiesFile);
+}
 
 function getYtdlpCookieArgs(): string[] {
     if (COOKIES_FROM_BROWSER) {
@@ -78,7 +86,9 @@ const app = fastify({
         level: 'info',
         transport: isDev ? { target: 'pino-pretty' } : undefined
     },
-    bodyLimit: 1048576 // 1MB
+    bodyLimit: 1048576, // 1MB
+    connectionTimeout: 0,  // disable connection timeout
+    requestTimeout: 0,     // disable request timeout (Railway proxy handles it)
 });
 
 const __filename = fileURLToPath(import.meta.url);
