@@ -182,7 +182,12 @@ app.register(fastifyStatic, {
     root: downloadsDir,
     prefix: '/downloads/',
     setHeaders: (res, filePath) => {
-        res.setHeader('Content-Disposition', `attachment; filename="${path.basename(filePath)}"`);
+        const rawName = path.basename(filePath);
+        // ASCII-safe fallback (strips emoji, non-latin chars) for the filename= param
+        const safeName = rawName.replace(/[^\x20-\x7E]/g, '_').replace(/"/g, "'");
+        // UTF-8 encoded name for clients that support RFC 5987 filename*=
+        const encodedName = encodeURIComponent(rawName);
+        res.setHeader('Content-Disposition', `attachment; filename="${safeName}"; filename*=UTF-8''${encodedName}`);
         res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition');
     }
 });
