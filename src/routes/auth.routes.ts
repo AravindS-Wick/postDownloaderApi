@@ -58,7 +58,7 @@ export async function authRoutes(fastify: FastifyInstance) {
         }
     });
 
-    // Token refresh — issues a new JWT if current one is still valid
+    // Token refresh — issues a new JWT with fresh role from DB
     fastify.post('/refresh', async (request, reply) => {
         try {
             await request.jwtVerify();
@@ -69,7 +69,12 @@ export async function authRoutes(fastify: FastifyInstance) {
                 return reply.code(401).send({ success: false, error: 'User not found' });
             }
 
-            const newToken = fastify.jwt.sign({ userId, email } as JwtPayload);
+            if (user.is_blocked) {
+                return reply.code(403).send({ success: false, error: 'Your account has been blocked' });
+            }
+
+            // Re-read role from DB so any role changes take effect immediately on next refresh
+            const newToken = fastify.jwt.sign({ userId, email, role: user.role } as JwtPayload);
             return { success: true, token: newToken };
         } catch {
             return reply.code(401).send({ success: false, error: 'Invalid or expired token' });
@@ -82,7 +87,7 @@ export async function authRoutes(fastify: FastifyInstance) {
 
         if (!isValidPlatform(platform)) {
             reply.code(400);
-            return { success: false, error: `Unsupported platform: ${platform}. Supported: instagram, youtube, twitter, tiktok` };
+            return { success: false, error: `Unsupported platform: ${platform}. Supported: instagram, youtube, twitter` };
         }
 
         try {
