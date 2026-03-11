@@ -46,29 +46,103 @@ db.exec(`
   );
 
   CREATE INDEX IF NOT EXISTS idx_guest_downloads_ip ON guest_downloads(ip);
+
+  CREATE TABLE IF NOT EXISTS bug_reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reporter_email TEXT NOT NULL,
+    error_text TEXT NOT NULL,
+    image_base64 TEXT,
+    status TEXT NOT NULL DEFAULT 'todo'
+      CHECK(status IN ('todo','inprogress','pr-raised','verify','blocked','fixed')),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_bug_reports_status ON bug_reports(status);
+  CREATE INDEX IF NOT EXISTS idx_bug_reports_reporter ON bug_reports(reporter_email);
 `);
 
+// Migrate existing users table: add new columns if they don't exist
+// SQLite supports ALTER TABLE ADD COLUMN safely on existing tables
+try { db.exec(`ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'`); } catch {}
+try { db.exec(`ALTER TABLE users ADD COLUMN is_blocked INTEGER NOT NULL DEFAULT 0`); } catch {}
+try { db.exec(`ALTER TABLE users ADD COLUMN monthly_downloads INTEGER NOT NULL DEFAULT 0`); } catch {}
+try { db.exec(`ALTER TABLE users ADD COLUMN month_reset_at INTEGER NOT NULL DEFAULT 0`); } catch {}
+
 // --- User helpers ---
+
+export type UserRole = 'admin' | 'owner' | 'tester' | 'user';
 
 export interface DbUser {
   email: string;
   password: string;
   created_at: number;
+  role: UserRole;
+  is_blocked: number;
+  monthly_downloads: number;
+  month_reset_at: number;
 }
 
-const stmtGetUser = db.prepare('SELECT email, password, created_at FROM users WHERE email = ?');
-const stmtCreateUser = db.prepare('INSERT INTO users (email, password, created_at) VALUES (?, ?, ?)');
+const stmtGetUser = db.prepare('SELECT * FROM users WHERE email = ?');
+const stmtCreateUser = db.prepare(
+  `INSERT INTO users (email, password, created_at, role, is_blocked, monthly_downloads, month_reset_at)
+   VALUES (?, ?, ?, ?, 0, 0, 0)`
+);
 
 export function getUser(email: string): DbUser | undefined {
   return stmtGetUser.get(email) as DbUser | undefined;
 }
 
-export function createUser(email: string, passwordHash: string): void {
-  stmtCreateUser.run(email, passwordHash, Date.now());
+export function createUser(email: string, passwordHash: string, role: UserRole = 'user'): void {
+  stmtCreateUser.run(email, passwordHash, Date.now(), role);
 }
 
 export function userExists(email: string): boolean {
   return getUser(email) !== undefined;
+}
+
+export function setUserRole(email: string, role: UserRole): void {
+  db.prepare('UPDATE users SET role = ? WHERE email = ?').run(role, email);
+}
+
+export function setUserBlocked(email: string, blocked: boolean): void {
+  db.prepare('UPDATE users SET is_blocked = ? WHERE email = ?').run(blocked ? 1 : 0, email);
+}
+
+export function deleteUser(email: string): void {
+  db.prepare('DELETE FROM users WHERE email = ?').run(email);
+}
+
+export function getAllUsers(): Omit<DbUser, 'password'>[] {
+  return db.prepare(
+    'SELECT email, created_at, role, is_blocked, monthly_downloads, month_reset_at FROM users ORDER BY created_at DESC'
+  ).all() as Omit<DbUser, 'password'>[];
+}
+
+export function incrementMonthlyDownloads(email: string): void {
+  db.prepare('UPDATE users SET monthly_downloads = monthly_downloads + 1 WHERE email = ?').run(email);
+}
+
+export function resetMonthlyDownloadsIfNeeded(email: string): void {
+  const user = getUser(email);
+  if (!user) return;
+  const now = new Date();
+  const resetDate = new Date(user.month_reset_at);
+  if (
+    user.month_reset_at === 0 ||
+    resetDate.getMonth() !== now.getMonth() ||
+    resetDate.getFullYear() !== now.getFullYear()
+  ) {
+    db.prepare('UPDATE users SET monthly_downloads = 0, month_reset_at = ? WHERE email = ?').run(
+      Date.now(),
+      email
+    );
+  }
+}
+
+export function getMonthlyDownloadCount(email: string): number {
+  const user = getUser(email);
+  return user?.monthly_downloads ?? 0;
 }
 
 // --- Download helpers ---
@@ -168,6 +242,68 @@ const DEFAULT_SEED_USERS = [
     }
   }
 })();
+
+// --- DB stats helper ---
+
+export interface DbStats {
+  users: number;
+  downloads: number;
+  bugReports: number;
+  guestDownloads: number;
+}
+
+export function getDbStats(): DbStats {
+  const users = (db.prepare('SELECT COUNT(*) AS count FROM users').get() as { count: number }).count;
+  const downloads = (db.prepare('SELECT COUNT(*) AS count FROM downloads').get() as { count: number }).count;
+  const bugReports = (db.prepare('SELECT COUNT(*) AS count FROM bug_reports').get() as { count: number }).count;
+  const guestDownloads = (db.prepare('SELECT COUNT(*) AS count FROM guest_downloads').get() as { count: number }).count;
+  return { users, downloads, bugReports, guestDownloads };
+}
+
+export function clearDownloadLogs(): void {
+  db.exec('DELETE FROM downloads; DELETE FROM guest_downloads;');
+}
+
+// --- Bug report helpers ---
+
+export type BugStatus = 'todo' | 'inprogress' | 'pr-raised' | 'verify' | 'blocked' | 'fixed';
+
+export interface DbBugReport {
+  id: number;
+  reporter_email: string;
+  error_text: string;
+  image_base64: string | null;
+  status: BugStatus;
+  created_at: number;
+  updated_at: number;
+}
+
+export function createBugReport(
+  reporterEmail: string,
+  errorText: string,
+  imageBase64?: string
+): number {
+  const now = Date.now();
+  const result = db.prepare(
+    `INSERT INTO bug_reports (reporter_email, error_text, image_base64, status, created_at, updated_at)
+     VALUES (?, ?, ?, 'todo', ?, ?)`
+  ).run(reporterEmail, errorText, imageBase64 ?? null, now, now);
+  return result.lastInsertRowid as number;
+}
+
+export function getAllBugReports(): DbBugReport[] {
+  return db.prepare(
+    'SELECT * FROM bug_reports ORDER BY created_at DESC'
+  ).all() as DbBugReport[];
+}
+
+export function updateBugStatus(id: number, status: BugStatus): void {
+  db.prepare('UPDATE bug_reports SET status = ?, updated_at = ? WHERE id = ?').run(
+    status,
+    Date.now(),
+    id
+  );
+}
 
 // Graceful shutdown
 export function closeDatabase(): void {

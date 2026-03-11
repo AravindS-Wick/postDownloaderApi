@@ -13,7 +13,17 @@ import jwt from '@fastify/jwt';
 import { fileURLToPath } from 'url';
 import fastifyStatic from '@fastify/static';
 import rateLimit from '@fastify/rate-limit';
-import { closeDatabase, getGuestDownloadCount, logGuestDownload } from './db/database.js';
+import {
+  closeDatabase,
+  getGuestDownloadCount,
+  logGuestDownload,
+  getUser,
+  resetMonthlyDownloadsIfNeeded,
+  incrementMonthlyDownloads,
+} from './db/database.js';
+import { adminRoutes } from './routes/admin.routes.js';
+import { bugsRoutes } from './routes/bugs.routes.js';
+import type { JwtPayload } from './types/auth.types.js';
 import {
     buildDownloadFilename,
     isYouTubeUrl,
@@ -129,7 +139,7 @@ app.register(cors, {
     origin: process.env.CORS_ORIGINS
         ? process.env.CORS_ORIGINS.split(',').map(o => o.trim())
         : (isDev ? devOrigins : []),
-    methods: ['GET', 'POST', 'OPTIONS'],
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'Content-Disposition', 'Accept', 'Origin', 'X-Requested-With'],
     exposedHeaders: ['Content-Disposition', 'Content-Length', 'Content-Type'],
     credentials: true,
@@ -195,10 +205,12 @@ app.register(fastifyStatic, {
 // Register routes
 app.register(authRoutes, { prefix: '/api/auth' });
 app.register(userRoutes, { prefix: '/api/user' });
+app.register(adminRoutes, { prefix: '/api/admin' });
+app.register(bugsRoutes, { prefix: '/api' });
 
 // ── Types ──────────────────────────────────────────────────────────────
 
-type DownloadType = 'video' | 'audio';
+type DownloadType = 'video' | 'audio' | 'image';
 
 type DownloadResult = {
     success: boolean;
@@ -215,7 +227,7 @@ type DownloadResult = {
 
 interface DownloadRequest {
     url: string;
-    type: DownloadType;
+    type: DownloadType | string;
     format?: string;
     quality?: string;
     useAutoFormat?: boolean;
@@ -565,6 +577,68 @@ function extractAudioQualities(formats: any[]): string[] {
     return qualities;
 }
 
+// ── Image download handler ─────────────────────────────────────────────
+// Downloads the best available image/thumbnail from a post URL using yt-dlp.
+// Used for Instagram photo posts and other image-only content.
+
+async function downloadImage(url: string, platform: string): Promise<DownloadResult> {
+    const baseName = `${platform.toLowerCase()}_${Date.now()}`;
+    const outputTemplate = path.join(downloadsDir, baseName);
+
+    // Use yt-dlp to write the best thumbnail / image, skipping video download
+    try {
+        await execFileAsync('yt-dlp', [
+            url,
+            '--write-thumbnail',
+            '--skip-download',
+            '--convert-thumbnails', 'jpg',
+            '-o', outputTemplate,
+            '--no-warnings',
+            ...getYtdlpCookieArgs(),
+        ], { timeout: YTDLP_TIMEOUT_MS, maxBuffer: YTDLP_MAX_BUFFER });
+    } catch (dlError: any) {
+        if (dlError?.killed) throw new Error('Download timed out');
+        if (dlError?.stderr) throw new Error(parseYtdlpError(dlError.stderr, platform));
+        throw dlError;
+    }
+
+    // yt-dlp writes <outputTemplate>.jpg or <outputTemplate>.webp — find it
+    const possibleExts = ['jpg', 'jpeg', 'webp', 'png'];
+    let finalFilename: string | null = null;
+    for (const ext of possibleExts) {
+        const candidate = `${baseName}.${ext}`;
+        if (fs.existsSync(path.join(downloadsDir, candidate))) {
+            finalFilename = candidate;
+            break;
+        }
+    }
+
+    if (!finalFilename) {
+        throw new Error('Image download failed — no image file was produced');
+    }
+
+    // Fetch metadata for title/thumbnail (best-effort)
+    let title = `${platform} Image`;
+    let thumbnail = '';
+    try {
+        const { stdout } = await execFileAsync('yt-dlp', [
+            url, '--dump-json', '--no-warnings', ...getYtdlpCookieArgs(),
+        ], { timeout: YTDLP_TIMEOUT_MS, maxBuffer: YTDLP_MAX_BUFFER });
+        const info = JSON.parse(stdout);
+        title = info.title || title;
+        thumbnail = info.thumbnail || '';
+    } catch { /* metadata is optional */ }
+
+    return {
+        success: true,
+        downloadUrl: `/downloads/${encodeURIComponent(finalFilename)}`,
+        filename: finalFilename,
+        title,
+        thumbnail,
+        quality: 'image',
+    };
+}
+
 // ── Generic download handler ───────────────────────────────────────────
 
 async function downloadMedia(
@@ -578,6 +652,12 @@ async function downloadMedia(
         console.log(`Starting ${platform} download for URL: ${url}`);
 
         const cleanUrl = isYouTubeUrl(url) ? normalizeYouTubeUrl(url) : url;
+
+        // ── Image download (Instagram photos, etc.) ─────────────────────────
+        if (type === 'image') {
+            return await downloadImage(cleanUrl, platform);
+        }
+
         const ext = type === 'audio' ? 'm4a' : 'mp4';
         const tempFilename = `${platform.toLowerCase()}_${Date.now()}.${ext}`;
         outputPath = path.join(downloadsDir, tempFilename);
@@ -744,16 +824,61 @@ async function downloadMedia(
 // Download route
 app.post('/api/download', {
     preHandler: async (request, reply) => {
-        if (!FREEMIUM_ENABLED) return; // all downloads free when disabled
-
-        // Authenticated users bypass the guest limit
+        // Try to authenticate
+        let authenticated = false;
         try {
             await request.jwtVerify();
-            return; // valid JWT — allow
-        } catch {
-            // No valid JWT — check guest limit
+            authenticated = true;
+        } catch { /* no valid JWT — guest */ }
+
+        if (authenticated) {
+            const { email } = request.user as JwtPayload;
+            const user = getUser(email);
+
+            if (!user) {
+                return reply.code(401).send({ success: false, error: 'User not found' });
+            }
+            if (user.is_blocked) {
+                return reply.code(403).send({ success: false, error: 'Your account has been blocked' });
+            }
+
+            // admin and tester: unlimited
+            if (user.role === 'admin' || user.role === 'tester') return;
+
+            // owner: 50/month
+            if (user.role === 'owner') {
+                resetMonthlyDownloadsIfNeeded(email);
+                const count = user.monthly_downloads;
+                if (count >= 50) {
+                    return reply.code(403).send({
+                        success: false,
+                        error: 'Monthly download limit reached (50 posts/month for owners)',
+                        monthlyLimitReached: true,
+                        downloadsUsed: count,
+                    });
+                }
+                return;
+            }
+
+            // user role: 10 free post-login downloads, then requires upgrade
+            if (user.role === 'user') {
+                resetMonthlyDownloadsIfNeeded(email);
+                const count = user.monthly_downloads;
+                if (count >= 10) {
+                    return reply.code(403).send({
+                        success: false,
+                        error: 'Watch an ad or upgrade for unlimited downloads',
+                        requiresUpgrade: true,
+                        downloadsUsed: count,
+                    });
+                }
+                return;
+            }
+            return;
         }
 
+        // Guest (no JWT): enforce freemium limit
+        if (!FREEMIUM_ENABLED) return;
         const count = getGuestDownloadCount(request.ip);
         if (count >= FREEMIUM_LIMIT) {
             return reply.code(403).send({
@@ -779,8 +904,8 @@ app.post('/api/download', {
             return reply.code(400).send({ success: false, error: urlValidation.error });
         }
 
-        if (!type || !['video', 'audio'].includes(type)) {
-            return reply.code(400).send({ success: false, error: 'Type must be "video" or "audio"' });
+        if (!type || !['video', 'audio', 'image'].includes(type)) {
+            return reply.code(400).send({ success: false, error: 'Type must be "video", "audio", or "image"' });
         }
 
         const downloadOptions: DownloadOptions = {
@@ -795,6 +920,10 @@ app.post('/api/download', {
             platform = 'Instagram';
         } else if (url.includes('twitter.com') || url.includes('x.com')) {
             platform = 'Twitter';
+        // } else if (url.includes('tiktok.com')) {  // TikTok: coming soon
+        //     platform = 'TikTok';
+        // } else if (url.includes('facebook.com') || url.includes('fb.watch')) {  // Facebook: coming soon
+        //     platform = 'Facebook';
         } else {
             return reply.code(400).send({
                 success: false,
@@ -802,16 +931,19 @@ app.post('/api/download', {
             });
         }
 
-        const result = await downloadMedia(url, type, platform, downloadOptions);
+        const result = await downloadMedia(url, type as DownloadType, platform, downloadOptions);
 
-        // Track guest download for freemium limiting
-        if (FREEMIUM_ENABLED) {
-            let isGuest = true;
-            try {
-                await request.jwtVerify();
-                isGuest = false;
-            } catch { /* no valid JWT — guest user */ }
-            if (isGuest) {
+        // Track download counts for limiting
+        try {
+            await request.jwtVerify();
+            const { email, role } = request.user as JwtPayload;
+            // Increment monthly counter for owner and user roles
+            if (role === 'owner' || role === 'user') {
+                incrementMonthlyDownloads(email);
+            }
+        } catch {
+            // Guest — log for freemium IP tracking
+            if (FREEMIUM_ENABLED) {
                 logGuestDownload(request.ip);
             }
         }
@@ -846,13 +978,15 @@ const infoHandler = async (request: FastifyRequest<{ Querystring: { url: string 
             return reply.code(400).send({ success: false, error: urlValidation.error });
         }
 
-        // Determine platform
+        // Determine platform (TikTok and Facebook: coming soon — commented out)
         const isYT = isYouTubeUrl(url);
         const isInsta = url.includes('instagram.com');
         const isTwitter = url.includes('twitter.com') || url.includes('x.com');
+        // const isTikTok = url.includes('tiktok.com');  // TikTok: coming soon
+        // const isFacebook = url.includes('facebook.com') || url.includes('fb.watch');  // Facebook: coming soon
 
         if (!isYT && !isInsta && !isTwitter) {
-            return reply.code(400).send({ success: false, error: 'Unsupported platform' });
+            return reply.code(400).send({ success: false, error: 'Unsupported platform. Supported: YouTube, Instagram, Twitter/X' });
         }
 
         const cleanUrl = isYT ? normalizeYouTubeUrl(url) : url;

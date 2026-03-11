@@ -26,14 +26,19 @@ export class AuthService {
             throw new Error('Invalid credentials');
         }
 
+        if (storedUser.is_blocked) {
+            throw new Error('Your account has been blocked');
+        }
+
         const user: UserProfile = {
             id: email,
             email: storedUser.email,
             name: storedUser.email.split('@')[0],
+            role: storedUser.role,
             platforms: []
         };
 
-        const payload: JwtPayload = { userId: user.id, email: user.email };
+        const payload: JwtPayload = { userId: user.id, email: user.email, role: storedUser.role };
         const token = this.fastify.jwt.sign(payload);
         return { token, user };
     }
@@ -51,8 +56,8 @@ export class AuthService {
                 return this.platformService.getYouTubeAuthUrl(platformConfig);
             case 'twitter':
                 return this.platformService.getTwitterAuthUrl(platformConfig);
-            case 'tiktok':
-                return this.platformService.getTikTokAuthUrl(platformConfig);
+            // case 'tiktok':  // TikTok: coming soon
+            //     return this.platformService.getTikTokAuthUrl(platformConfig);
             default:
                 throw new Error(`Unsupported platform: ${platform}`);
         }
@@ -80,9 +85,9 @@ export class AuthService {
             case 'twitter':
                 authResponse = await this.platformService.handleTwitterCallback(code, platformConfig, codeVerifier);
                 break;
-            case 'tiktok':
-                authResponse = await this.platformService.handleTikTokCallback(code, platformConfig);
-                break;
+            // case 'tiktok':  // TikTok: coming soon
+            //     authResponse = await this.platformService.handleTikTokCallback(code, platformConfig);
+            //     break;
             default:
                 throw new Error(`Unsupported platform: ${platform}`);
         }
@@ -110,6 +115,7 @@ export class AuthService {
                 id: storedUser.email,
                 email: storedUser.email,
                 name: storedUser.email.split('@')[0],
+                role: storedUser.role,
                 platforms: []
             };
         }
