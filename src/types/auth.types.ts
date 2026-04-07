@@ -35,6 +35,8 @@ export interface PlatformAuthResponse {
 export interface AuthConfig {
     jwtSecret: string;
     jwtExpiresIn: string;
+    refreshTokenExpiresIn: number;
+    verificationCodeExpiresIn: number;
     platforms: {
         [key: string]: PlatformAuthConfig;
     };

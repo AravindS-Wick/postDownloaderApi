@@ -18,8 +18,10 @@ import {
   getGuestDownloadCount,
   logGuestDownload,
   getUser,
+  setUserRole,
   resetMonthlyDownloadsIfNeeded,
   incrementMonthlyDownloads,
+  cleanExpiredRefreshTokens,
 } from './db/database.js';
 import { adminRoutes } from './routes/admin.routes.js';
 import { bugsRoutes } from './routes/bugs.routes.js';
@@ -87,6 +89,15 @@ function getYtdlpCookieArgs(): string[] {
     return [];
 }
 
+/**
+ * Extra yt-dlp args for YouTube URLs.
+ * --geo-bypass spoofs XFF headers to bypass regional content restrictions
+ * that block datacenter IPs (Railway, Fly.io, etc.) without cookies.
+ */
+function getYouTubeExtraArgs(): string[] {
+    return ['--geo-bypass'];
+}
+
 // Freemium config — set FREEMIUM_ENABLED=true in .env to gate downloads after the limit
 const FREEMIUM_ENABLED = process.env.FREEMIUM_ENABLED === 'true';
 const FREEMIUM_LIMIT = Number(process.env.FREEMIUM_LIMIT) || 10;
@@ -104,22 +115,69 @@ const app = fastify({
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Add request logging
+// ── Security logger ────────────────────────────────────────────────────
+
+// Patterns that suggest probing / scanning activity
+const SUSPICIOUS_PATTERNS = [
+    /\.\.(\/|\\)/,           // path traversal
+    /<script/i,              // XSS probe
+    /union\s+select/i,       // SQL injection
+    /exec\s*\(/i,            // code exec probe
+    /\/etc\/passwd/i,        // LFI probe
+    /\beval\b/i,
+    /\bphpinfo\b/i,
+];
+
+function isSuspicious(request: FastifyRequest): boolean {
+    const target = `${request.url} ${JSON.stringify(request.headers['user-agent'] ?? '')}`;
+    return SUSPICIOUS_PATTERNS.some(p => p.test(target));
+}
+
+// Log every inbound request
 app.addHook('onRequest', (request: FastifyRequest, reply: FastifyReply, done: HookHandlerDoneFunction) => {
-    console.log(`[${new Date().toISOString()}] ${request.method} ${request.url}`);
+    const ts = new Date().toISOString();
+    if (isSuspicious(request)) {
+        app.log.warn({
+            event: 'suspicious_request',
+            method: request.method,
+            url: request.url,
+            ip: request.ip,
+            ua: request.headers['user-agent'],
+            ts,
+        }, 'Suspicious request pattern detected');
+    } else {
+        app.log.info({ method: request.method, url: request.url, ip: request.ip, ts }, 'incoming');
+    }
     done();
 });
 
-// Add response logging
+// Log every response — highlight 4xx/5xx
 app.addHook('onResponse', (request: FastifyRequest, reply: FastifyReply, done: HookHandlerDoneFunction) => {
-    console.log(`[${new Date().toISOString()}] ${request.method} ${request.url} - ${reply.statusCode}`);
+    const ts = new Date().toISOString();
+    const status = reply.statusCode;
+    const logData = { method: request.method, url: request.url, status, ip: request.ip, ts };
+
+    if (status >= 500) {
+        app.log.error(logData, 'Server error response');
+    } else if (status === 429) {
+        app.log.warn({ ...logData, event: 'rate_limit_hit' }, 'Rate limit exceeded');
+    } else if (status >= 400) {
+        app.log.warn(logData, 'Client error response');
+    } else {
+        app.log.info(logData, 'response');
+    }
     done();
 });
 
-// Rate limiting
+// Rate limiting — global default + per-route overrides below
 await app.register(rateLimit, {
     max: 100,
-    timeWindow: '1 minute'
+    timeWindow: '1 minute',
+    errorResponseBuilder: (_request, context) => ({
+        success: false,
+        error: 'Too many requests. Please slow down.',
+        retryAfter: Math.ceil((context as any).ttl / 1000),
+    }),
 });
 
 // Enable CORS
@@ -248,6 +306,7 @@ interface YtFormat {
     vcodec: string;
     ext: string;
     filesize?: number;
+    filesize_approx?: number;
     abr?: number;
     tbr?: number;
     format_note?: string;
@@ -411,7 +470,7 @@ function pickByQuality(
 
     const sorted = [...candidateFormats].sort((a, b) =>
         ((b.height ?? 0) - (a.height ?? 0)) ||
-        ((b.filesize ?? 0) - (a.filesize ?? 0)) ||
+        ((b.filesize ?? b.filesize_approx ?? 0) - (a.filesize ?? a.filesize_approx ?? 0)) ||
         ((b.tbr ?? 0) - (a.tbr ?? 0))
     );
 
@@ -666,7 +725,9 @@ async function downloadMedia(
         let videoInfo: any = null;
         try {
             const { stdout: infoJson } = await execFileAsync('yt-dlp', [
-                cleanUrl, '--dump-json', '--no-warnings', ...getYtdlpCookieArgs()
+                cleanUrl, '--dump-json', '--no-warnings',
+                ...(isYouTubeUrl(cleanUrl) ? getYouTubeExtraArgs() : []),
+                ...getYtdlpCookieArgs(),
             ], { timeout: YTDLP_TIMEOUT_MS, maxBuffer: YTDLP_MAX_BUFFER });
             videoInfo = JSON.parse(infoJson);
             console.log(`${platform} info retrieved successfully`);
@@ -696,6 +757,7 @@ async function downloadMedia(
             '--no-warnings',
             '--progress',
             '--newline',
+            ...(isYouTubeUrl(cleanUrl) ? getYouTubeExtraArgs() : []),
             ...getYtdlpCookieArgs(),
         ];
 
@@ -995,7 +1057,9 @@ const infoHandler = async (request: FastifyRequest<{ Querystring: { url: string 
         let videoInfo: any;
         try {
             const { stdout: infoJson } = await execFileAsync('yt-dlp', [
-                cleanUrl, '--dump-json', '--no-warnings', ...getYtdlpCookieArgs()
+                cleanUrl, '--dump-json', '--no-warnings',
+                ...(isYT ? getYouTubeExtraArgs() : []),
+                ...getYtdlpCookieArgs(),
             ], { timeout: YTDLP_TIMEOUT_MS, maxBuffer: YTDLP_MAX_BUFFER });
             videoInfo = JSON.parse(infoJson);
         } catch (infoError: any) {
@@ -1031,12 +1095,50 @@ const infoHandler = async (request: FastifyRequest<{ Querystring: { url: string 
             })
             : nativeQualities;
 
+        // Build per-quality estimated file sizes from raw yt-dlp format data.
+        // For each quality label, find the best-matching video format and sum
+        // its filesize with the best available audio stream filesize.
+        // Fallback: estimate from tbr (kbps) × duration when filesize fields are absent.
+        const duration: number = videoInfo.duration ?? 0;
+        const estimateFromTbr = (f: any): number => {
+            const tbr: number = f.tbr ?? 0;
+            return tbr > 0 && duration > 0 ? Math.round((tbr * 1000 / 8) * duration) : 0;
+        };
+        const formatSize = (f: any): number =>
+            f.filesize ?? f.filesize_approx ?? estimateFromTbr(f);
+
+        const audioFormats = rawFormats.filter((f: any) =>
+            f.acodec && f.acodec !== 'none' && f.vcodec === 'none'
+        );
+        const bestAudioSize = audioFormats.reduce((best: number, f: any) => {
+            const s = formatSize(f);
+            return s > best ? s : best;
+        }, 0);
+
+        const qualitiesWithSize: { label: string; filesize: number | null }[] = qualities.map((label: string) => {
+            const targetHeight = parseQualityHeight(label);
+            const videoFormats = rawFormats.filter((f: any) =>
+                f.vcodec && f.vcodec !== 'none' && typeof f.height === 'number' && f.height > 0
+            );
+            // Find the closest video format at or below the target height
+            const match = targetHeight
+                ? videoFormats
+                    .filter((f: any) => f.height <= targetHeight)
+                    .sort((a: any, b: any) => b.height - a.height)[0]
+                : videoFormats.sort((a: any, b: any) => b.height - a.height)[0];
+
+            const videoSize: number = match ? formatSize(match) : 0;
+            const total = videoSize + bestAudioSize;
+            return { label, filesize: total > 0 ? total : null };
+        });
+
         const info: any = {
             title: videoInfo.title || `${platformName} Post`,
             duration: videoInfo.duration,
             thumbnail: videoInfo.thumbnail || '',
             author: videoInfo.uploader || 'Unknown',
             qualities,
+            qualitiesWithSize,
             audioQualities,
         };
 
@@ -1064,11 +1166,13 @@ const infoHandler = async (request: FastifyRequest<{ Querystring: { url: string 
     }
 };
 
-app.get('/api/info', infoHandler);
-app.get('/api/media/info', infoHandler);
+// 30 info lookups per minute per IP — metadata fetch, called on every URL paste
+const infoRateLimit = { config: { rateLimit: { max: 30, timeWindow: '1 minute' } } };
+app.get('/api/info', infoRateLimit, infoHandler);
+app.get('/api/media/info', infoRateLimit, infoHandler);
 
 // Download status endpoint (downloads are synchronous, so this is a stub for UI compatibility)
-app.get('/api/media/status/:downloadId', async (request, reply) => {
+app.get('/api/media/status/:downloadId', { config: { rateLimit: { max: 60, timeWindow: '1 minute' } } }, async (request, reply) => {
     const { downloadId } = request.params as { downloadId: string };
     return reply.send({
         success: true,
@@ -1174,6 +1278,7 @@ app.post('/api/channel-posts', {
                 // It's a video URL — extract channel_url with lightweight --print
                 const { stdout: channelUrl } = await execFileAsync('yt-dlp', [
                     normalizedUrl, '--print', 'channel_url', '--no-warnings', '--no-download', '--playlist-items', '1',
+                    ...getYouTubeExtraArgs(),
                     ...getYtdlpCookieArgs(),
                 ], { timeout: YTDLP_TIMEOUT_MS, maxBuffer: 1024 * 1024 });
 
@@ -1198,6 +1303,7 @@ app.post('/api/channel-posts', {
             '--dump-json',
             '--no-warnings',
             '--playlist-items', `${startItem}:${fetchEnd}`,
+            ...getYouTubeExtraArgs(),
             ...getYtdlpCookieArgs(),
         ];
 
@@ -1262,7 +1368,7 @@ app.post('/api/channel-posts', {
 });
 
 // Guest remaining downloads endpoint
-app.get('/api/downloads/remaining', async (request, reply) => {
+app.get('/api/downloads/remaining', { config: { rateLimit: { max: 20, timeWindow: '1 minute' } } }, async (request, reply) => {
     const used = getGuestDownloadCount(request.ip);
     return reply.send({
         freemiumEnabled: FREEMIUM_ENABLED,
@@ -1273,12 +1379,12 @@ app.get('/api/downloads/remaining', async (request, reply) => {
 });
 
 // Root route
-app.get('/', async () => {
+app.get('/', { config: { rateLimit: { max: 30, timeWindow: '1 minute' } } }, async () => {
     return { message: 'Social Media Downloader API is running' };
 });
 
 // Health check route
-app.get('/health', async () => {
+app.get('/health', { config: { rateLimit: { max: 20, timeWindow: '1 minute' } } }, async () => {
     const checks: Record<string, string> = { status: 'ok' };
 
     try {
@@ -1331,6 +1437,22 @@ let cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
 // ── Server lifecycle ───────────────────────────────────────────────────
 
+function bootstrapRoles() {
+    const ownerEmail = process.env.OWNER_EMAIL?.trim();
+    const adminEmails = (process.env.ADMIN_EMAILS ?? '').split(',').map(e => e.trim()).filter(Boolean);
+
+    if (ownerEmail && getUser(ownerEmail)) {
+        setUserRole(ownerEmail, 'owner');
+        console.log(`[bootstrap] ${ownerEmail} → owner`);
+    }
+    for (const email of adminEmails) {
+        if (email !== ownerEmail && getUser(email)) {
+            setUserRole(email, 'admin');
+            console.log(`[bootstrap] ${email} → admin`);
+        }
+    }
+}
+
 const start = async () => {
     try {
         const port = Number(process.env.PORT ?? 2500);
@@ -1338,10 +1460,16 @@ const start = async () => {
         await app.listen({ port, host });
         console.log(`Server is running on ${host}:${port}`);
 
+        bootstrapRoles();
+
         // Start cleanup scheduler
-        cleanupTimer = setInterval(cleanupOldDownloads, CLEANUP_INTERVAL_MS);
+        cleanupTimer = setInterval(() => {
+            cleanupOldDownloads();
+            cleanExpiredRefreshTokens();
+        }, CLEANUP_INTERVAL_MS);
         // Run once on startup
         cleanupOldDownloads();
+        cleanExpiredRefreshTokens();
     } catch (err) {
         app.log.error(err);
         process.exit(1);

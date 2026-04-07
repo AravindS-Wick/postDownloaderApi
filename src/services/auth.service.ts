@@ -2,8 +2,9 @@ import type { FastifyInstance } from 'fastify';
 import type { UserProfile, SocialPlatform, JwtPayload } from '../types/auth.types.js';
 import { PlatformService } from './platform.service.js';
 import { authConfig } from '../config/auth.config.js';
+import crypto from 'crypto';
 import bcrypt from 'bcryptjs';
-import { getUser } from '../db/database.js';
+import { getUser, storeRefreshToken, getRefreshToken, revokeRefreshToken, revokeAllUserRefreshTokens } from '../db/database.js';
 
 export class AuthService {
     private fastify: FastifyInstance;
@@ -14,8 +15,8 @@ export class AuthService {
         this.platformService = new PlatformService(fastify);
     }
 
-    async login(email: string, password: string): Promise<{ token: string; user: UserProfile }> {
-        const storedUser = getUser(email);
+    async login(email: string, password: string): Promise<{ token: string; refreshToken: string; user: UserProfile }> {
+        const storedUser = getUser(email.trim().toLowerCase());
 
         if (!storedUser) {
             throw new Error('Invalid credentials');
@@ -24,6 +25,10 @@ export class AuthService {
         const passwordMatch = await bcrypt.compare(password, storedUser.password);
         if (!passwordMatch) {
             throw new Error('Invalid credentials');
+        }
+
+        if (!storedUser.is_verified) {
+            throw new Error('EMAIL_NOT_VERIFIED');
         }
 
         if (storedUser.is_blocked) {
@@ -40,7 +45,41 @@ export class AuthService {
 
         const payload: JwtPayload = { userId: user.id, email: user.email, role: storedUser.role };
         const token = this.fastify.jwt.sign(payload);
-        return { token, user };
+
+        const refreshToken = crypto.randomBytes(64).toString('hex');
+        const refreshExpiresAt = Date.now() + authConfig.refreshTokenExpiresIn;
+        storeRefreshToken(refreshToken, user.email, refreshExpiresAt);
+
+        return { token, refreshToken, user };
+    }
+
+    async refreshAccessToken(refreshTokenValue: string): Promise<{ token: string; refreshToken: string }> {
+        const storedToken = getRefreshToken(refreshTokenValue);
+
+        if (!storedToken || storedToken.revoked || storedToken.expires_at < Date.now()) {
+            throw new Error('Invalid or expired refresh token');
+        }
+
+        const user = getUser(storedToken.user_email);
+        if (!user || user.is_blocked) {
+            throw new Error('User not found or blocked');
+        }
+
+        // Rotate: revoke old, issue new
+        revokeRefreshToken(refreshTokenValue);
+
+        const payload: JwtPayload = { userId: user.email, email: user.email, role: user.role };
+        const newAccessToken = this.fastify.jwt.sign(payload);
+
+        const newRefreshToken = crypto.randomBytes(64).toString('hex');
+        const refreshExpiresAt = Date.now() + authConfig.refreshTokenExpiresIn;
+        storeRefreshToken(newRefreshToken, user.email, refreshExpiresAt);
+
+        return { token: newAccessToken, refreshToken: newRefreshToken };
+    }
+
+    async logoutUser(email: string): Promise<void> {
+        revokeAllUserRefreshTokens(email);
     }
 
     async getAuthUrl(platform: string): Promise<string> {

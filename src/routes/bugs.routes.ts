@@ -14,11 +14,12 @@ const VALID_STATUSES: BugStatus[] = [
 
 export async function bugsRoutes(fastify: FastifyInstance) {
   // POST /api/bugs — submit a bug report (any authenticated user)
+  // 5 submissions per hour per IP — prevents spam
   fastify.post<{
     Body: { errorText: string; imageBase64?: string };
   }>(
     '/bugs',
-    { preHandler: requireAuth() },
+    { preHandler: requireAuth(), config: { rateLimit: { max: 5, timeWindow: '1 hour' } } },
     async (request, reply) => {
       const { errorText, imageBase64 } = request.body;
       const { email } = request.user as JwtPayload;
@@ -56,7 +57,7 @@ export async function bugsRoutes(fastify: FastifyInstance) {
   // GET /api/bugs — list all bug reports (admin and tester only)
   fastify.get(
     '/bugs',
-    { preHandler: checkRole('admin', 'tester') },
+    { preHandler: checkRole('admin', 'tester'), config: { rateLimit: { max: 30, timeWindow: '1 minute' } } },
     async (_request, reply) => {
       const reports = getAllBugReports();
       // Strip image data from list view for performance — clients fetch full report separately if needed
@@ -71,7 +72,7 @@ export async function bugsRoutes(fastify: FastifyInstance) {
   // GET /api/bugs/:id — get single bug report with image (admin and tester)
   fastify.get<{ Params: { id: string } }>(
     '/bugs/:id',
-    { preHandler: checkRole('admin', 'tester') },
+    { preHandler: checkRole('admin', 'tester'), config: { rateLimit: { max: 30, timeWindow: '1 minute' } } },
     async (request, reply) => {
       const id = parseInt(request.params.id, 10);
       if (isNaN(id)) return reply.code(400).send({ success: false, error: 'Invalid id' });
@@ -90,7 +91,7 @@ export async function bugsRoutes(fastify: FastifyInstance) {
     Body: { status: BugStatus };
   }>(
     '/bugs/:id',
-    { preHandler: checkRole('admin') },
+    { preHandler: checkRole('admin'), config: { rateLimit: { max: 20, timeWindow: '1 minute' } } },
     async (request, reply) => {
       const id = parseInt(request.params.id, 10);
       if (isNaN(id)) return reply.code(400).send({ success: false, error: 'Invalid id' });
