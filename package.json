@@ -18,14 +18,15 @@
     "@fastify/static": "^6.12.0",
     "@fastify/swagger": "^8.12.1",
     "@fastify/swagger-ui": "^1.10.1",
-    "axios": "^1.7.9",
     "@types/bcryptjs": "^2.4.6",
+    "axios": "^1.7.9",
     "bcryptjs": "^2.4.3",
     "better-sqlite3": "^12.6.2",
     "dotenv": "^16.3.1",
     "fastify": "^4.24.3",
     "file-uri-to-path": "^2.0.0",
-    "pino-pretty": "^10.2.3"
+    "pino-pretty": "^10.2.3",
+    "resend": "^6.10.0"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",

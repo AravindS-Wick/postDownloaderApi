@@ -68,6 +68,26 @@ try { db.exec(`ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'`);
 try { db.exec(`ALTER TABLE users ADD COLUMN is_blocked INTEGER NOT NULL DEFAULT 0`); } catch {}
 try { db.exec(`ALTER TABLE users ADD COLUMN monthly_downloads INTEGER NOT NULL DEFAULT 0`); } catch {}
 try { db.exec(`ALTER TABLE users ADD COLUMN month_reset_at INTEGER NOT NULL DEFAULT 0`); } catch {}
+try { db.exec(`ALTER TABLE users ADD COLUMN is_verified INTEGER NOT NULL DEFAULT 0`); } catch {}
+try { db.exec(`ALTER TABLE users ADD COLUMN verification_code TEXT`); } catch {}
+try { db.exec(`ALTER TABLE users ADD COLUMN verification_expires INTEGER`); } catch {}
+try { db.exec(`ALTER TABLE users ADD COLUMN password_reset_token TEXT`); } catch {}
+try { db.exec(`ALTER TABLE users ADD COLUMN password_reset_expires INTEGER`); } catch {}
+
+// Refresh tokens table
+db.exec(`
+  CREATE TABLE IF NOT EXISTS refresh_tokens (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    token TEXT UNIQUE NOT NULL,
+    user_email TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    revoked INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY (user_email) REFERENCES users(email) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_refresh_tokens_token ON refresh_tokens(token);
+  CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user ON refresh_tokens(user_email);
+`);
 
 // --- User helpers ---
 
@@ -81,6 +101,9 @@ export interface DbUser {
   is_blocked: number;
   monthly_downloads: number;
   month_reset_at: number;
+  is_verified: number;
+  verification_code: string | null;
+  verification_expires: number | null;
 }
 
 const stmtGetUser = db.prepare('SELECT * FROM users WHERE email = ?');
@@ -115,7 +138,7 @@ export function deleteUser(email: string): void {
 
 export function getAllUsers(): Omit<DbUser, 'password'>[] {
   return db.prepare(
-    'SELECT email, created_at, role, is_blocked, monthly_downloads, month_reset_at FROM users ORDER BY created_at DESC'
+    'SELECT email, created_at, role, is_blocked, monthly_downloads, month_reset_at, is_verified FROM users ORDER BY created_at DESC'
   ).all() as Omit<DbUser, 'password'>[];
 }
 
@@ -143,6 +166,68 @@ export function resetMonthlyDownloadsIfNeeded(email: string): void {
 export function getMonthlyDownloadCount(email: string): number {
   const user = getUser(email);
   return user?.monthly_downloads ?? 0;
+}
+
+// --- Verification helpers ---
+
+export function setVerificationCode(email: string, code: string, expiresAt: number): void {
+  db.prepare('UPDATE users SET verification_code = ?, verification_expires = ? WHERE email = ?')
+    .run(code, expiresAt, email);
+}
+
+export function markEmailVerified(email: string): void {
+  db.prepare('UPDATE users SET is_verified = 1, verification_code = NULL, verification_expires = NULL WHERE email = ?')
+    .run(email);
+}
+
+export function updatePassword(email: string, hashedPassword: string): void {
+  db.prepare('UPDATE users SET password = ? WHERE email = ?')
+    .run(hashedPassword, email);
+}
+
+export function setPasswordResetToken(email: string, token: string, expiresAt: number): void {
+  db.prepare('UPDATE users SET password_reset_token = ?, password_reset_expires = ? WHERE email = ?')
+    .run(token, expiresAt, email);
+}
+
+export function getPasswordResetToken(email: string): { token: string; expires_at: number } | undefined {
+  return db.prepare('SELECT password_reset_token as token, password_reset_expires as expires_at FROM users WHERE email = ?').get(email) as any;
+}
+
+export function validatePasswordResetToken(email: string, token: string): boolean {
+  const user = getPasswordResetToken(email);
+  if (!user || !user.token) return false;
+  if (user.token !== token) return false;
+  if (Date.now() > user.expires_at) return false;
+  return true;
+}
+
+export function clearPasswordResetToken(email: string): void {
+  db.prepare('UPDATE users SET password_reset_token = NULL, password_reset_expires = NULL WHERE email = ?')
+    .run(email);
+}
+
+// --- Refresh token helpers ---
+
+export function storeRefreshToken(token: string, userEmail: string, expiresAt: number): void {
+  db.prepare('INSERT INTO refresh_tokens (token, user_email, expires_at, created_at) VALUES (?, ?, ?, ?)')
+    .run(token, userEmail, expiresAt, Date.now());
+}
+
+export function getRefreshToken(token: string): { token: string; user_email: string; expires_at: number; revoked: number } | undefined {
+  return db.prepare('SELECT * FROM refresh_tokens WHERE token = ?').get(token) as any;
+}
+
+export function revokeRefreshToken(token: string): void {
+  db.prepare('UPDATE refresh_tokens SET revoked = 1 WHERE token = ?').run(token);
+}
+
+export function revokeAllUserRefreshTokens(userEmail: string): void {
+  db.prepare('UPDATE refresh_tokens SET revoked = 1 WHERE user_email = ?').run(userEmail);
+}
+
+export function cleanExpiredRefreshTokens(): void {
+  db.prepare('DELETE FROM refresh_tokens WHERE expires_at < ? OR revoked = 1').run(Date.now());
 }
 
 // --- Download helpers ---

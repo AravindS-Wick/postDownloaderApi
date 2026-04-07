@@ -1,14 +1,7 @@
 import fastify from 'fastify';
-import axios from 'axios';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { PlatformService } from '../services/platform.service.js';
 import type { PlatformAuthConfig } from '../types/auth.types.js';
-
-vi.mock('axios', () => ({
-    default: {
-        post: vi.fn()
-    }
-}));
 
 const PLATFORM_CONFIG: PlatformAuthConfig = {
     clientId: 'client-id',
@@ -112,14 +105,14 @@ describe('PlatformService', () => {
         });
 
         it('handles TikTok callback', async () => {
-            const mockedPost = vi.mocked((axios as any).post, true);
-            mockedPost.mockResolvedValueOnce({
-                data: {
+            vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+                ok: true,
+                json: () => Promise.resolve({
                     access_token: 'tk-access',
                     refresh_token: 'tk-refresh',
                     expires_in: 3600
-                }
-            });
+                })
+            } as any));
 
             const result = await service.handleTikTokCallback('code', PLATFORM_CONFIG);
             expect(result).toEqual({
@@ -127,7 +120,6 @@ describe('PlatformService', () => {
                 refreshToken: 'tk-refresh',
                 expiresIn: 3600
             });
-            expect(mockedPost).toHaveBeenCalled();
         });
     });
 });

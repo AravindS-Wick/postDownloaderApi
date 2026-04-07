@@ -1,12 +1,6 @@
 import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
-import bcrypt from 'bcryptjs';
-import { getUser, createUser, userExists, logDownload, getUserDownloads } from '../db/database.js';
-import { validatePasswordStrength, VALID_DOWNLOAD_TYPES, VALID_LOG_STATUSES, MAX_META_SIZE } from '../utils/validation.js';
-
-interface SignupRequest {
-    email: string;
-    password: string;
-}
+import { getUser, logDownload, getUserDownloads } from '../db/database.js';
+import { VALID_DOWNLOAD_TYPES, VALID_LOG_STATUSES, MAX_META_SIZE } from '../utils/validation.js';
 
 interface LogRequest {
     email?: string;
@@ -17,40 +11,18 @@ interface LogRequest {
 }
 
 export default async function userRoutes(fastify: FastifyInstance) {
-    // Signup
-    fastify.post<{ Body: SignupRequest }>('/signup', {
+    // Signup — DEPRECATED: use /api/auth/register instead
+    fastify.post('/signup', {
         config: { rateLimit: { max: 5, timeWindow: '1 minute' } }
-    }, async (request: FastifyRequest<{ Body: SignupRequest }>, reply: FastifyReply) => {
-        const { email, password } = request.body;
-        if (!email || !password) {
-            return reply.code(400).send({ message: 'Email and password required' });
-        }
-
-        if (typeof email !== 'string' || email.length > 255 || !email.includes('@')) {
-            return reply.code(400).send({ message: 'Invalid email format' });
-        }
-
-        const pwCheck = validatePasswordStrength(password);
-        if (!pwCheck.valid) {
-            return reply.code(400).send({ message: pwCheck.error });
-        }
-
-        try {
-            if (userExists(email)) {
-                return reply.code(409).send({ message: 'User already exists' });
-            }
-
-            const hash = await bcrypt.hash(password, 10);
-            createUser(email, hash);
-            reply.send({ success: true });
-        } catch (error) {
-            console.error('Signup error:', error);
-            return reply.code(500).send({ message: 'Internal server error' });
-        }
+    }, async (request: FastifyRequest, reply: FastifyReply) => {
+        return reply.code(410).send({
+            success: false,
+            message: 'This endpoint is deprecated. Use POST /api/auth/register instead.'
+        });
     });
 
     // Get profile — requires JWT auth
-    fastify.get('/profile', async (request: FastifyRequest, reply: FastifyReply) => {
+    fastify.get('/profile', { config: { rateLimit: { max: 30, timeWindow: '1 minute' } } }, async (request: FastifyRequest, reply: FastifyReply) => {
         try {
             await request.jwtVerify();
             const payload = request.user as { userId: string; email: string };
@@ -67,8 +39,8 @@ export default async function userRoutes(fastify: FastifyInstance) {
         }
     });
 
-    // Log download attempt/completion/consent
-    fastify.post<{ Body: LogRequest }>('/log', async (request: FastifyRequest<{ Body: LogRequest }>, reply: FastifyReply) => {
+    // Log download attempt/completion/consent — 60/min, high because it fires per download step
+    fastify.post<{ Body: LogRequest }>('/log', { config: { rateLimit: { max: 60, timeWindow: '1 minute' } } }, async (request: FastifyRequest<{ Body: LogRequest }>, reply: FastifyReply) => {
         try {
             const { email, type, status, meta, ageConsent } = request.body;
 

@@ -14,7 +14,9 @@ if (!process.env.JWT_SECRET && isDev) {
 
 export const authConfig: AuthConfig = {
     jwtSecret: process.env.JWT_SECRET || (isDev ? generatedDevSecret : ''),
-    jwtExpiresIn: '24h',
+    jwtExpiresIn: '15m',
+    refreshTokenExpiresIn: 7 * 24 * 60 * 60 * 1000, // 7 days in ms
+    verificationCodeExpiresIn: 15 * 60 * 1000, // 15 minutes in ms
     platforms: {
         instagram: {
             clientId: process.env.INSTAGRAM_CLIENT_ID || '',
