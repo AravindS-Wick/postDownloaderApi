@@ -21,6 +21,10 @@ export class AuthService {
             throw new Error('Invalid credentials');
         }
 
+        if (storedUser.is_blocked) {
+            throw new Error('Account is blocked');
+        }
+
         const passwordMatch = await bcrypt.compare(password, storedUser.password);
         if (!passwordMatch) {
             throw new Error('Invalid credentials');
@@ -30,10 +34,11 @@ export class AuthService {
             id: email,
             email: storedUser.email,
             name: storedUser.email.split('@')[0],
+            role: storedUser.role,
             platforms: []
         };
 
-        const payload: JwtPayload = { userId: user.id, email: user.email };
+        const payload: JwtPayload = { userId: user.id, email: user.email, role: user.role };
         const token = this.fastify.jwt.sign(payload);
         return { token, user };
     }
@@ -110,6 +115,7 @@ export class AuthService {
                 id: storedUser.email,
                 email: storedUser.email,
                 name: storedUser.email.split('@')[0],
+                role: storedUser.role,
                 platforms: []
             };
         }

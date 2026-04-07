@@ -8,10 +8,13 @@ export interface SocialPlatform {
     expiresAt?: number;
 }
 
+export type UserRole = 'admin' | 'owner' | 'tester' | 'user';
+
 export interface UserProfile {
     id: string;
     email: string;
     name: string;
+    role: UserRole;
     platforms: SocialPlatform[];
 }
 
@@ -40,4 +43,5 @@ export interface AuthConfig {
 export interface JwtPayload {
     userId: string;
     email: string;
-} 
+    role: UserRole;
+}
