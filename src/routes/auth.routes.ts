@@ -77,7 +77,7 @@ export async function authRoutes(fastify: FastifyInstance) {
 
     // ── Authenticated: Token refresh ──────────────────────────────────────────
     fastify.post('/refresh', { preHandler: requireRole('user') }, async (request, reply) => {
-        const { userId, email, role } = request.user as JwtPayload;
+        const { userId, email, role: _role } = request.user as JwtPayload;
         const user = getUser(email);
         if (!user) return reply.code(401).send({ success: false, error: 'User not found' });
         const newToken = fastify.jwt.sign({ userId, email, role: user.role });
@@ -93,6 +93,12 @@ export async function authRoutes(fastify: FastifyInstance) {
         } catch {
             return reply.code(401).send({ success: false, error: 'Not authenticated' });
         }
+    });
+
+    // ── Authenticated: Logout (client-side token invalidation) ───────────────
+    fastify.post('/logout', { preHandler: requireRole('user') }, async () => {
+        // JWT is stateless — client drops the token. Return 200 so the UI can clean up state.
+        return { success: true, message: 'Logged out' };
     });
 
     // ── Authenticated: Change password ────────────────────────────────────────
@@ -121,19 +127,19 @@ export async function authRoutes(fastify: FastifyInstance) {
     // ── Authenticated: Forgot / Reset password ────────────────────────────────
     fastify.post<{ Body: { email: string } }>('/forgot-password', {
         config: { rateLimit: { max: 3, timeWindow: '1 minute' } }
-    }, async (request, reply) => {
+    }, async () => {
         // Generic response to prevent email enumeration
         return { success: true, message: 'If an account with that email exists, a reset token has been sent.' };
     });
 
     fastify.post<{ Body: { email: string; resetToken: string; newPassword: string } }>('/reset-password', {
         config: { rateLimit: { max: 5, timeWindow: '1 minute' } }
-    }, async (request, reply) => {
+    }, async (_request, reply) => {
         return reply.code(501).send({ success: false, message: 'Reset via email not yet configured. Use change-password.' });
     });
 
     // ── Admin: List all users ─────────────────────────────────────────────────
-    fastify.get('/admin/users', { preHandler: requireRole('admin') }, async (request, reply) => {
+    fastify.get('/admin/users', { preHandler: requireRole('admin') }, async () => {
         return { success: true, users: listAllUsers() };
     });
 
@@ -181,13 +187,13 @@ export async function authRoutes(fastify: FastifyInstance) {
     });
 
     // ── Admin: Clear ALL download logs ────────────────────────────────────────
-    fastify.delete('/admin/logs', { preHandler: requireRole('admin') }, async (request, reply) => {
+    fastify.delete('/admin/logs', { preHandler: requireRole('admin') }, async () => {
         clearAllDownloadLogs();
         return { success: true, message: 'All download logs cleared' };
     });
 
     // ── Admin: DB stats ───────────────────────────────────────────────────────
-    fastify.get('/admin/stats', { preHandler: requireRole('admin') }, async (request, reply) => {
+    fastify.get('/admin/stats', { preHandler: requireRole('admin') }, async () => {
         return { success: true, stats: getDbStats() };
     });
 
