@@ -12,5 +12,5 @@ coverage/
 *.orig
 .zencoder
 /test-downloads/*
-/db/
+/db
 cookies.txt

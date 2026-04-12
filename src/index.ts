@@ -391,7 +391,7 @@ function parseYtdlpError(stderr: string, platform: string): string {
     if (lower.includes('inappropriate') || lower.includes('unavailable for certain audiences')) {
         return 'This content is restricted by the platform. Set COOKIES_FROM_BROWSER in .env to access it';
     }
-    if (lower.includes('no video could be found') || lower.includes('no video in this tweet') || lower.includes('no formats found')) {
+    if (lower.includes('no video could be found') || lower.includes('no video in this tweet') || lower.includes('no formats found') || lower.includes('there is no video in this post')) {
         return 'No video found in this post. This may be a text or image-only post';
     }
     if (lower.includes('unsupported url')) {
