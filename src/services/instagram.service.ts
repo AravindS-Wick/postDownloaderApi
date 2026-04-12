@@ -64,6 +64,8 @@ function loadInstagramCookiesFromFile(cookiesFile: string): string {
 }
 
 const COOKIES_FILE = (() => {
+    // COOKIES_CONTENT env var (cloud): index.ts writes it to /tmp/cookies.txt at startup
+    if (process.env.COOKIES_CONTENT) return '/tmp/cookies.txt';
     const raw = process.env.COOKIES_FILE || '';
     if (!raw) return '';
     return path.isAbsolute(raw) ? raw : path.resolve(process.cwd(), raw);
