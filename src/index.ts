@@ -13,7 +13,19 @@ import jwt from '@fastify/jwt';
 import { fileURLToPath } from 'url';
 import fastifyStatic from '@fastify/static';
 import rateLimit from '@fastify/rate-limit';
-import { closeDatabase, getGuestDownloadCount, logGuestDownload } from './db/database.js';
+import {
+  closeDatabase,
+  getGuestDownloadCount,
+  logGuestDownload,
+  getUser,
+  setUserRole,
+  resetMonthlyDownloadsIfNeeded,
+  incrementMonthlyDownloads,
+  cleanExpiredRefreshTokens,
+} from './db/database.js';
+import { adminRoutes } from './routes/admin.routes.js';
+import { bugsRoutes } from './routes/bugs.routes.js';
+import type { JwtPayload } from './types/auth.types.js';
 import {
     buildDownloadFilename,
     isYouTubeUrl,
@@ -77,6 +89,15 @@ function getYtdlpCookieArgs(): string[] {
     return [];
 }
 
+/**
+ * Extra yt-dlp args for YouTube URLs.
+ * --geo-bypass spoofs XFF headers to bypass regional content restrictions
+ * that block datacenter IPs (Railway, Fly.io, etc.) without cookies.
+ */
+function getYouTubeExtraArgs(): string[] {
+    return ['--geo-bypass'];
+}
+
 // Freemium config — set FREEMIUM_ENABLED=true in .env to gate downloads after the limit
 const FREEMIUM_ENABLED = process.env.FREEMIUM_ENABLED === 'true';
 const FREEMIUM_LIMIT = Number(process.env.FREEMIUM_LIMIT) || 10;
@@ -94,22 +115,69 @@ const app = fastify({
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Add request logging
+// ── Security logger ────────────────────────────────────────────────────
+
+// Patterns that suggest probing / scanning activity
+const SUSPICIOUS_PATTERNS = [
+    /\.\.(\/|\\)/,           // path traversal
+    /<script/i,              // XSS probe
+    /union\s+select/i,       // SQL injection
+    /exec\s*\(/i,            // code exec probe
+    /\/etc\/passwd/i,        // LFI probe
+    /\beval\b/i,
+    /\bphpinfo\b/i,
+];
+
+function isSuspicious(request: FastifyRequest): boolean {
+    const target = `${request.url} ${JSON.stringify(request.headers['user-agent'] ?? '')}`;
+    return SUSPICIOUS_PATTERNS.some(p => p.test(target));
+}
+
+// Log every inbound request
 app.addHook('onRequest', (request: FastifyRequest, reply: FastifyReply, done: HookHandlerDoneFunction) => {
-    console.log(`[${new Date().toISOString()}] ${request.method} ${request.url}`);
+    const ts = new Date().toISOString();
+    if (isSuspicious(request)) {
+        app.log.warn({
+            event: 'suspicious_request',
+            method: request.method,
+            url: request.url,
+            ip: request.ip,
+            ua: request.headers['user-agent'],
+            ts,
+        }, 'Suspicious request pattern detected');
+    } else {
+        app.log.info({ method: request.method, url: request.url, ip: request.ip, ts }, 'incoming');
+    }
     done();
 });
 
-// Add response logging
+// Log every response — highlight 4xx/5xx
 app.addHook('onResponse', (request: FastifyRequest, reply: FastifyReply, done: HookHandlerDoneFunction) => {
-    console.log(`[${new Date().toISOString()}] ${request.method} ${request.url} - ${reply.statusCode}`);
+    const ts = new Date().toISOString();
+    const status = reply.statusCode;
+    const logData = { method: request.method, url: request.url, status, ip: request.ip, ts };
+
+    if (status >= 500) {
+        app.log.error(logData, 'Server error response');
+    } else if (status === 429) {
+        app.log.warn({ ...logData, event: 'rate_limit_hit' }, 'Rate limit exceeded');
+    } else if (status >= 400) {
+        app.log.warn(logData, 'Client error response');
+    } else {
+        app.log.info(logData, 'response');
+    }
     done();
 });
 
-// Rate limiting
+// Rate limiting — global default + per-route overrides below
 await app.register(rateLimit, {
     max: 100,
-    timeWindow: '1 minute'
+    timeWindow: '1 minute',
+    errorResponseBuilder: (_request, context) => ({
+        success: false,
+        error: 'Too many requests. Please slow down.',
+        retryAfter: Math.ceil((context as any).ttl / 1000),
+    }),
 });
 
 // Enable CORS
@@ -129,7 +197,7 @@ app.register(cors, {
     origin: process.env.CORS_ORIGINS
         ? process.env.CORS_ORIGINS.split(',').map(o => o.trim())
         : (isDev ? devOrigins : []),
-    methods: ['GET', 'POST', 'OPTIONS'],
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'Content-Disposition', 'Accept', 'Origin', 'X-Requested-With'],
     exposedHeaders: ['Content-Disposition', 'Content-Length', 'Content-Type'],
     credentials: true,
@@ -195,10 +263,12 @@ app.register(fastifyStatic, {
 // Register routes
 app.register(authRoutes, { prefix: '/api/auth' });
 app.register(userRoutes, { prefix: '/api/user' });
+app.register(adminRoutes, { prefix: '/api/admin' });
+app.register(bugsRoutes, { prefix: '/api' });
 
 // ── Types ──────────────────────────────────────────────────────────────
 
-type DownloadType = 'video' | 'audio';
+type DownloadType = 'video' | 'audio' | 'image';
 
 type DownloadResult = {
     success: boolean;
@@ -215,7 +285,7 @@ type DownloadResult = {
 
 interface DownloadRequest {
     url: string;
-    type: DownloadType;
+    type: DownloadType | string;
     format?: string;
     quality?: string;
     useAutoFormat?: boolean;
@@ -236,6 +306,7 @@ interface YtFormat {
     vcodec: string;
     ext: string;
     filesize?: number;
+    filesize_approx?: number;
     abr?: number;
     tbr?: number;
     format_note?: string;
@@ -399,7 +470,7 @@ function pickByQuality(
 
     const sorted = [...candidateFormats].sort((a, b) =>
         ((b.height ?? 0) - (a.height ?? 0)) ||
-        ((b.filesize ?? 0) - (a.filesize ?? 0)) ||
+        ((b.filesize ?? b.filesize_approx ?? 0) - (a.filesize ?? a.filesize_approx ?? 0)) ||
         ((b.tbr ?? 0) - (a.tbr ?? 0))
     );
 
@@ -565,6 +636,68 @@ function extractAudioQualities(formats: any[]): string[] {
     return qualities;
 }
 
+// ── Image download handler ─────────────────────────────────────────────
+// Downloads the best available image/thumbnail from a post URL using yt-dlp.
+// Used for Instagram photo posts and other image-only content.
+
+async function downloadImage(url: string, platform: string): Promise<DownloadResult> {
+    const baseName = `${platform.toLowerCase()}_${Date.now()}`;
+    const outputTemplate = path.join(downloadsDir, baseName);
+
+    // Use yt-dlp to write the best thumbnail / image, skipping video download
+    try {
+        await execFileAsync('yt-dlp', [
+            url,
+            '--write-thumbnail',
+            '--skip-download',
+            '--convert-thumbnails', 'jpg',
+            '-o', outputTemplate,
+            '--no-warnings',
+            ...getYtdlpCookieArgs(),
+        ], { timeout: YTDLP_TIMEOUT_MS, maxBuffer: YTDLP_MAX_BUFFER });
+    } catch (dlError: any) {
+        if (dlError?.killed) throw new Error('Download timed out');
+        if (dlError?.stderr) throw new Error(parseYtdlpError(dlError.stderr, platform));
+        throw dlError;
+    }
+
+    // yt-dlp writes <outputTemplate>.jpg or <outputTemplate>.webp — find it
+    const possibleExts = ['jpg', 'jpeg', 'webp', 'png'];
+    let finalFilename: string | null = null;
+    for (const ext of possibleExts) {
+        const candidate = `${baseName}.${ext}`;
+        if (fs.existsSync(path.join(downloadsDir, candidate))) {
+            finalFilename = candidate;
+            break;
+        }
+    }
+
+    if (!finalFilename) {
+        throw new Error('Image download failed — no image file was produced');
+    }
+
+    // Fetch metadata for title/thumbnail (best-effort)
+    let title = `${platform} Image`;
+    let thumbnail = '';
+    try {
+        const { stdout } = await execFileAsync('yt-dlp', [
+            url, '--dump-json', '--no-warnings', ...getYtdlpCookieArgs(),
+        ], { timeout: YTDLP_TIMEOUT_MS, maxBuffer: YTDLP_MAX_BUFFER });
+        const info = JSON.parse(stdout);
+        title = info.title || title;
+        thumbnail = info.thumbnail || '';
+    } catch { /* metadata is optional */ }
+
+    return {
+        success: true,
+        downloadUrl: `/downloads/${encodeURIComponent(finalFilename)}`,
+        filename: finalFilename,
+        title,
+        thumbnail,
+        quality: 'image',
+    };
+}
+
 // ── Generic download handler ───────────────────────────────────────────
 
 async function downloadMedia(
@@ -578,6 +711,12 @@ async function downloadMedia(
         console.log(`Starting ${platform} download for URL: ${url}`);
 
         const cleanUrl = isYouTubeUrl(url) ? normalizeYouTubeUrl(url) : url;
+
+        // ── Image download (Instagram photos, etc.) ─────────────────────────
+        if (type === 'image') {
+            return await downloadImage(cleanUrl, platform);
+        }
+
         const ext = type === 'audio' ? 'm4a' : 'mp4';
         const tempFilename = `${platform.toLowerCase()}_${Date.now()}.${ext}`;
         outputPath = path.join(downloadsDir, tempFilename);
@@ -586,7 +725,9 @@ async function downloadMedia(
         let videoInfo: any = null;
         try {
             const { stdout: infoJson } = await execFileAsync('yt-dlp', [
-                cleanUrl, '--dump-json', '--no-warnings', ...getYtdlpCookieArgs()
+                cleanUrl, '--dump-json', '--no-warnings',
+                ...(isYouTubeUrl(cleanUrl) ? getYouTubeExtraArgs() : []),
+                ...getYtdlpCookieArgs(),
             ], { timeout: YTDLP_TIMEOUT_MS, maxBuffer: YTDLP_MAX_BUFFER });
             videoInfo = JSON.parse(infoJson);
             console.log(`${platform} info retrieved successfully`);
@@ -616,6 +757,7 @@ async function downloadMedia(
             '--no-warnings',
             '--progress',
             '--newline',
+            ...(isYouTubeUrl(cleanUrl) ? getYouTubeExtraArgs() : []),
             ...getYtdlpCookieArgs(),
         ];
 
@@ -744,16 +886,61 @@ async function downloadMedia(
 // Download route
 app.post('/api/download', {
     preHandler: async (request, reply) => {
-        if (!FREEMIUM_ENABLED) return; // all downloads free when disabled
-
-        // Authenticated users bypass the guest limit
+        // Try to authenticate
+        let authenticated = false;
         try {
             await request.jwtVerify();
-            return; // valid JWT — allow
-        } catch {
-            // No valid JWT — check guest limit
+            authenticated = true;
+        } catch { /* no valid JWT — guest */ }
+
+        if (authenticated) {
+            const { email } = request.user as JwtPayload;
+            const user = getUser(email);
+
+            if (!user) {
+                return reply.code(401).send({ success: false, error: 'User not found' });
+            }
+            if (user.is_blocked) {
+                return reply.code(403).send({ success: false, error: 'Your account has been blocked' });
+            }
+
+            // admin and tester: unlimited
+            if (user.role === 'admin' || user.role === 'tester') return;
+
+            // owner: 50/month
+            if (user.role === 'owner') {
+                resetMonthlyDownloadsIfNeeded(email);
+                const count = user.monthly_downloads;
+                if (count >= 50) {
+                    return reply.code(403).send({
+                        success: false,
+                        error: 'Monthly download limit reached (50 posts/month for owners)',
+                        monthlyLimitReached: true,
+                        downloadsUsed: count,
+                    });
+                }
+                return;
+            }
+
+            // user role: 10 free post-login downloads, then requires upgrade
+            if (user.role === 'user') {
+                resetMonthlyDownloadsIfNeeded(email);
+                const count = user.monthly_downloads;
+                if (count >= 10) {
+                    return reply.code(403).send({
+                        success: false,
+                        error: 'Watch an ad or upgrade for unlimited downloads',
+                        requiresUpgrade: true,
+                        downloadsUsed: count,
+                    });
+                }
+                return;
+            }
+            return;
         }
 
+        // Guest (no JWT): enforce freemium limit
+        if (!FREEMIUM_ENABLED) return;
         const count = getGuestDownloadCount(request.ip);
         if (count >= FREEMIUM_LIMIT) {
             return reply.code(403).send({
@@ -779,8 +966,8 @@ app.post('/api/download', {
             return reply.code(400).send({ success: false, error: urlValidation.error });
         }
 
-        if (!type || !['video', 'audio'].includes(type)) {
-            return reply.code(400).send({ success: false, error: 'Type must be "video" or "audio"' });
+        if (!type || !['video', 'audio', 'image'].includes(type)) {
+            return reply.code(400).send({ success: false, error: 'Type must be "video", "audio", or "image"' });
         }
 
         const downloadOptions: DownloadOptions = {
@@ -795,6 +982,10 @@ app.post('/api/download', {
             platform = 'Instagram';
         } else if (url.includes('twitter.com') || url.includes('x.com')) {
             platform = 'Twitter';
+        // } else if (url.includes('tiktok.com')) {  // TikTok: coming soon
+        //     platform = 'TikTok';
+        // } else if (url.includes('facebook.com') || url.includes('fb.watch')) {  // Facebook: coming soon
+        //     platform = 'Facebook';
         } else {
             return reply.code(400).send({
                 success: false,
@@ -802,16 +993,19 @@ app.post('/api/download', {
             });
         }
 
-        const result = await downloadMedia(url, type, platform, downloadOptions);
+        const result = await downloadMedia(url, type as DownloadType, platform, downloadOptions);
 
-        // Track guest download for freemium limiting
-        if (FREEMIUM_ENABLED) {
-            let isGuest = true;
-            try {
-                await request.jwtVerify();
-                isGuest = false;
-            } catch { /* no valid JWT — guest user */ }
-            if (isGuest) {
+        // Track download counts for limiting
+        try {
+            await request.jwtVerify();
+            const { email, role } = request.user as JwtPayload;
+            // Increment monthly counter for owner and user roles
+            if (role === 'owner' || role === 'user') {
+                incrementMonthlyDownloads(email);
+            }
+        } catch {
+            // Guest — log for freemium IP tracking
+            if (FREEMIUM_ENABLED) {
                 logGuestDownload(request.ip);
             }
         }
@@ -846,13 +1040,15 @@ const infoHandler = async (request: FastifyRequest<{ Querystring: { url: string 
             return reply.code(400).send({ success: false, error: urlValidation.error });
         }
 
-        // Determine platform
+        // Determine platform (TikTok and Facebook: coming soon — commented out)
         const isYT = isYouTubeUrl(url);
         const isInsta = url.includes('instagram.com');
         const isTwitter = url.includes('twitter.com') || url.includes('x.com');
+        // const isTikTok = url.includes('tiktok.com');  // TikTok: coming soon
+        // const isFacebook = url.includes('facebook.com') || url.includes('fb.watch');  // Facebook: coming soon
 
         if (!isYT && !isInsta && !isTwitter) {
-            return reply.code(400).send({ success: false, error: 'Unsupported platform' });
+            return reply.code(400).send({ success: false, error: 'Unsupported platform. Supported: YouTube, Instagram, Twitter/X' });
         }
 
         const cleanUrl = isYT ? normalizeYouTubeUrl(url) : url;
@@ -861,7 +1057,9 @@ const infoHandler = async (request: FastifyRequest<{ Querystring: { url: string 
         let videoInfo: any;
         try {
             const { stdout: infoJson } = await execFileAsync('yt-dlp', [
-                cleanUrl, '--dump-json', '--no-warnings', ...getYtdlpCookieArgs()
+                cleanUrl, '--dump-json', '--no-warnings',
+                ...(isYT ? getYouTubeExtraArgs() : []),
+                ...getYtdlpCookieArgs(),
             ], { timeout: YTDLP_TIMEOUT_MS, maxBuffer: YTDLP_MAX_BUFFER });
             videoInfo = JSON.parse(infoJson);
         } catch (infoError: any) {
@@ -897,12 +1095,50 @@ const infoHandler = async (request: FastifyRequest<{ Querystring: { url: string 
             })
             : nativeQualities;
 
+        // Build per-quality estimated file sizes from raw yt-dlp format data.
+        // For each quality label, find the best-matching video format and sum
+        // its filesize with the best available audio stream filesize.
+        // Fallback: estimate from tbr (kbps) × duration when filesize fields are absent.
+        const duration: number = videoInfo.duration ?? 0;
+        const estimateFromTbr = (f: any): number => {
+            const tbr: number = f.tbr ?? 0;
+            return tbr > 0 && duration > 0 ? Math.round((tbr * 1000 / 8) * duration) : 0;
+        };
+        const formatSize = (f: any): number =>
+            f.filesize ?? f.filesize_approx ?? estimateFromTbr(f);
+
+        const audioFormats = rawFormats.filter((f: any) =>
+            f.acodec && f.acodec !== 'none' && f.vcodec === 'none'
+        );
+        const bestAudioSize = audioFormats.reduce((best: number, f: any) => {
+            const s = formatSize(f);
+            return s > best ? s : best;
+        }, 0);
+
+        const qualitiesWithSize: { label: string; filesize: number | null }[] = qualities.map((label: string) => {
+            const targetHeight = parseQualityHeight(label);
+            const videoFormats = rawFormats.filter((f: any) =>
+                f.vcodec && f.vcodec !== 'none' && typeof f.height === 'number' && f.height > 0
+            );
+            // Find the closest video format at or below the target height
+            const match = targetHeight
+                ? videoFormats
+                    .filter((f: any) => f.height <= targetHeight)
+                    .sort((a: any, b: any) => b.height - a.height)[0]
+                : videoFormats.sort((a: any, b: any) => b.height - a.height)[0];
+
+            const videoSize: number = match ? formatSize(match) : 0;
+            const total = videoSize + bestAudioSize;
+            return { label, filesize: total > 0 ? total : null };
+        });
+
         const info: any = {
             title: videoInfo.title || `${platformName} Post`,
             duration: videoInfo.duration,
             thumbnail: videoInfo.thumbnail || '',
             author: videoInfo.uploader || 'Unknown',
             qualities,
+            qualitiesWithSize,
             audioQualities,
         };
 
@@ -930,11 +1166,13 @@ const infoHandler = async (request: FastifyRequest<{ Querystring: { url: string 
     }
 };
 
-app.get('/api/info', infoHandler);
-app.get('/api/media/info', infoHandler);
+// 30 info lookups per minute per IP — metadata fetch, called on every URL paste
+const infoRateLimit = { config: { rateLimit: { max: 30, timeWindow: '1 minute' } } };
+app.get('/api/info', infoRateLimit, infoHandler);
+app.get('/api/media/info', infoRateLimit, infoHandler);
 
 // Download status endpoint (downloads are synchronous, so this is a stub for UI compatibility)
-app.get('/api/media/status/:downloadId', async (request, reply) => {
+app.get('/api/media/status/:downloadId', { config: { rateLimit: { max: 60, timeWindow: '1 minute' } } }, async (request, reply) => {
     const { downloadId } = request.params as { downloadId: string };
     return reply.send({
         success: true,
@@ -1040,6 +1278,7 @@ app.post('/api/channel-posts', {
                 // It's a video URL — extract channel_url with lightweight --print
                 const { stdout: channelUrl } = await execFileAsync('yt-dlp', [
                     normalizedUrl, '--print', 'channel_url', '--no-warnings', '--no-download', '--playlist-items', '1',
+                    ...getYouTubeExtraArgs(),
                     ...getYtdlpCookieArgs(),
                 ], { timeout: YTDLP_TIMEOUT_MS, maxBuffer: 1024 * 1024 });
 
@@ -1064,6 +1303,7 @@ app.post('/api/channel-posts', {
             '--dump-json',
             '--no-warnings',
             '--playlist-items', `${startItem}:${fetchEnd}`,
+            ...getYouTubeExtraArgs(),
             ...getYtdlpCookieArgs(),
         ];
 
@@ -1128,7 +1368,7 @@ app.post('/api/channel-posts', {
 });
 
 // Guest remaining downloads endpoint
-app.get('/api/downloads/remaining', async (request, reply) => {
+app.get('/api/downloads/remaining', { config: { rateLimit: { max: 20, timeWindow: '1 minute' } } }, async (request, reply) => {
     const used = getGuestDownloadCount(request.ip);
     return reply.send({
         freemiumEnabled: FREEMIUM_ENABLED,
@@ -1139,12 +1379,12 @@ app.get('/api/downloads/remaining', async (request, reply) => {
 });
 
 // Root route
-app.get('/', async () => {
+app.get('/', { config: { rateLimit: { max: 30, timeWindow: '1 minute' } } }, async () => {
     return { message: 'Social Media Downloader API is running' };
 });
 
 // Health check route
-app.get('/health', async () => {
+app.get('/health', { config: { rateLimit: { max: 20, timeWindow: '1 minute' } } }, async () => {
     const checks: Record<string, string> = { status: 'ok' };
 
     try {
@@ -1197,6 +1437,22 @@ let cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
 // ── Server lifecycle ───────────────────────────────────────────────────
 
+function bootstrapRoles() {
+    const ownerEmail = process.env.OWNER_EMAIL?.trim();
+    const adminEmails = (process.env.ADMIN_EMAILS ?? '').split(',').map(e => e.trim()).filter(Boolean);
+
+    if (ownerEmail && getUser(ownerEmail)) {
+        setUserRole(ownerEmail, 'owner');
+        console.log(`[bootstrap] ${ownerEmail} → owner`);
+    }
+    for (const email of adminEmails) {
+        if (email !== ownerEmail && getUser(email)) {
+            setUserRole(email, 'admin');
+            console.log(`[bootstrap] ${email} → admin`);
+        }
+    }
+}
+
 const start = async () => {
     try {
         const port = Number(process.env.PORT ?? 2500);
@@ -1204,10 +1460,16 @@ const start = async () => {
         await app.listen({ port, host });
         console.log(`Server is running on ${host}:${port}`);
 
+        bootstrapRoles();
+
         // Start cleanup scheduler
-        cleanupTimer = setInterval(cleanupOldDownloads, CLEANUP_INTERVAL_MS);
+        cleanupTimer = setInterval(() => {
+            cleanupOldDownloads();
+            cleanExpiredRefreshTokens();
+        }, CLEANUP_INTERVAL_MS);
         // Run once on startup
         cleanupOldDownloads();
+        cleanExpiredRefreshTokens();
     } catch (err) {
         app.log.error(err);
         process.exit(1);

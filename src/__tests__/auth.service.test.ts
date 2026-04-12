@@ -1,168 +1,165 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { AuthService } from '../services/auth.service';
-import { PlatformService } from '../services/platform.service';
+import { AuthService } from '../services/auth.service.js';
 import type { FastifyInstance } from 'fastify';
-import type { AuthConfig } from '../types/auth.types';
 
-// Mock FastifyInstance
-const mockFastify = {
-    jwt: {
-        sign: vi.fn().mockReturnValue('mock-token')
-    }
-} as unknown as FastifyInstance;
+// Prevent better-sqlite3 native module from loading
+vi.mock('../db/database.js', () => ({
+    getUser: vi.fn(),
+    createUser: vi.fn(),
+    userExists: vi.fn(),
+    logDownload: vi.fn(),
+    getUserDownloads: vi.fn(),
+    closeDatabase: vi.fn(),
+    storeRefreshToken: vi.fn(),
+    getRefreshToken: vi.fn(),
+    revokeRefreshToken: vi.fn(),
+    revokeAllUserRefreshTokens: vi.fn(),
+    setVerificationCode: vi.fn(),
+    markEmailVerified: vi.fn(),
+    cleanExpiredRefreshTokens: vi.fn(),
+}));
 
-// Mock PlatformService
-vi.mock('../services/platform.service', () => ({
+vi.mock('../services/platform.service.js', () => ({
     PlatformService: vi.fn().mockImplementation(() => ({
         getInstagramAuthUrl: vi.fn().mockResolvedValue('https://instagram.com/auth'),
         getYouTubeAuthUrl: vi.fn().mockResolvedValue('https://youtube.com/auth'),
         getTwitterAuthUrl: vi.fn().mockResolvedValue('https://twitter.com/auth'),
         getTikTokAuthUrl: vi.fn().mockResolvedValue('https://tiktok.com/auth'),
-        handleInstagramCallback: vi.fn().mockResolvedValue({
-            accessToken: 'instagram-token',
-            expiresIn: 3600
-        }),
-        handleYouTubeCallback: vi.fn().mockResolvedValue({
-            accessToken: 'youtube-token',
-            refreshToken: 'youtube-refresh',
-            expiresIn: 3600
-        }),
-        handleTwitterCallback: vi.fn().mockResolvedValue({
-            accessToken: 'twitter-token',
-            refreshToken: 'twitter-refresh',
-            expiresIn: 3600
-        }),
-        handleTikTokCallback: vi.fn().mockResolvedValue({
-            accessToken: 'tiktok-token',
-            refreshToken: 'tiktok-refresh',
-            expiresIn: 3600
-        })
-    }))
+        handleInstagramCallback: vi.fn().mockResolvedValue({ accessToken: 'ig-token', expiresIn: 3600 }),
+        handleYouTubeCallback: vi.fn().mockResolvedValue({ accessToken: 'yt-token', refreshToken: 'yt-refresh', expiresIn: 3600 }),
+        handleTwitterCallback: vi.fn().mockResolvedValue({ accessToken: 'tw-token', refreshToken: 'tw-refresh', expiresIn: 7200 }),
+        handleTikTokCallback: vi.fn().mockResolvedValue({ accessToken: 'tk-token', refreshToken: 'tk-refresh', expiresIn: 3600 }),
+    })),
+    isValidPlatform: vi.fn(),
+    validateOAuthState: vi.fn(),
 }));
 
-describe('AuthService', () => {
-    let authService: AuthService;
-    const mockConfig: AuthConfig = {
+vi.mock('../config/auth.config.js', () => ({
+    authConfig: {
         jwtSecret: 'test-secret',
-        jwtExpiresIn: '1h',
+        jwtExpiresIn: '15m',
+        refreshTokenExpiresIn: 7 * 24 * 60 * 60 * 1000,
+        verificationCodeExpiresIn: 15 * 60 * 1000,
         platforms: {
-            instagram: {
-                clientId: 'test-instagram-id',
-                clientSecret: 'test-instagram-secret',
-                redirectUri: 'http://localhost:5173/auth/callback/instagram',
-                scope: ['basic', 'user_profile']
-            },
-            youtube: {
-                clientId: 'test-youtube-id',
-                clientSecret: 'test-youtube-secret',
-                redirectUri: 'http://localhost:5173/auth/callback/youtube',
-                scope: ['https://www.googleapis.com/auth/youtube.readonly']
-            },
-            twitter: {
-                clientId: 'test-twitter-id',
-                clientSecret: 'test-twitter-secret',
-                redirectUri: 'http://localhost:5173/auth/callback/twitter',
-                scope: ['tweet.read', 'users.read']
-            },
-            tiktok: {
-                clientId: 'test-tiktok-id',
-                clientSecret: 'test-tiktok-secret',
-                redirectUri: 'http://localhost:5173/auth/callback/tiktok',
-                scope: ['user.info.basic']
-            }
+            instagram: { clientId: 'ig-id', clientSecret: 'ig-secret', redirectUri: 'http://localhost/cb', scope: [] },
+            youtube: { clientId: 'yt-id', clientSecret: 'yt-secret', redirectUri: 'http://localhost/cb', scope: [] },
+            twitter: { clientId: 'tw-id', clientSecret: 'tw-secret', redirectUri: 'http://localhost/cb', scope: [] },
         }
-    };
+    }
+}));
+
+import bcrypt from 'bcryptjs';
+import { getUser } from '../db/database.js';
+
+const mockFastify = {
+    jwt: { sign: vi.fn().mockReturnValue('mock-jwt-token') }
+} as unknown as FastifyInstance;
+
+describe('AuthService', () => {
+    let service: AuthService;
 
     beforeEach(() => {
-        authService = new AuthService(mockFastify, mockConfig);
         vi.clearAllMocks();
+        service = new AuthService(mockFastify);
     });
 
     describe('login', () => {
-        it('should return token and user profile', async () => {
-            const result = await authService.login('test@example.com', 'password');
-            expect(result).toEqual({
-                token: 'mock-token',
-                user: {
-                    id: '1',
-                    email: 'test@example.com',
-                    name: 'Test User',
-                    platforms: []
-                }
+        it('throws when user does not exist', async () => {
+            vi.mocked(getUser).mockReturnValue(undefined);
+            await expect(service.login('noone@test.com', 'pass')).rejects.toThrow('Invalid credentials');
+        });
+
+        it('throws when password is wrong', async () => {
+            const hash = await bcrypt.hash('correct', 10);
+            vi.mocked(getUser).mockReturnValue({
+                email: 'u@test.com', password: hash, created_at: 0,
+                role: 'user', is_blocked: 0, monthly_downloads: 0, month_reset_at: 0, is_verified: 1, verification_code: null, verification_expires: null
             });
+            await expect(service.login('u@test.com', 'wrong')).rejects.toThrow('Invalid credentials');
+        });
+
+        it('throws when account is blocked', async () => {
+            const hash = await bcrypt.hash('Password1', 10);
+            vi.mocked(getUser).mockReturnValue({
+                email: 'u@test.com', password: hash, created_at: 0,
+                role: 'user', is_blocked: 1, monthly_downloads: 0, month_reset_at: 0, is_verified: 1, verification_code: null, verification_expires: null
+            });
+            await expect(service.login('u@test.com', 'Password1')).rejects.toThrow('blocked');
+        });
+
+        it('returns token and user profile on success', async () => {
+            const hash = await bcrypt.hash('Password1', 10);
+            vi.mocked(getUser).mockReturnValue({
+                email: 'u@test.com', password: hash, created_at: 0,
+                role: 'user', is_blocked: 0, monthly_downloads: 0, month_reset_at: 0, is_verified: 1, verification_code: null, verification_expires: null
+            });
+            const result = await service.login('u@test.com', 'Password1');
+            expect(result.token).toBe('mock-jwt-token');
+            expect(result.refreshToken).toBeDefined();
+            expect(result.user.email).toBe('u@test.com');
+            expect(result.user.role).toBe('user');
         });
     });
 
     describe('getAuthUrl', () => {
-        it('should return Instagram auth URL', async () => {
-            const url = await authService.getAuthUrl('instagram');
+        it('returns Instagram auth URL', async () => {
+            const url = await service.getAuthUrl('instagram');
             expect(url).toBe('https://instagram.com/auth');
         });
 
-        it('should return YouTube auth URL', async () => {
-            const url = await authService.getAuthUrl('youtube');
+        it('returns YouTube auth URL', async () => {
+            const url = await service.getAuthUrl('youtube');
             expect(url).toBe('https://youtube.com/auth');
         });
 
-        it('should throw error for unsupported platform', async () => {
-            await expect(authService.getAuthUrl('unsupported')).rejects.toThrow('Unsupported platform: unsupported');
+        it('throws for unsupported platform', async () => {
+            await expect(service.getAuthUrl('tiktok')).rejects.toThrow('Unsupported platform');
         });
     });
 
     describe('connectPlatform', () => {
-        it('should connect Instagram platform', async () => {
-            const result = await authService.connectPlatform('instagram', 'test-code');
-            expect(result).toEqual({
-                id: 'instagram',
-                name: 'Instagram',
-                icon: '/instagram-icon.png',
-                isConnected: true,
-                accessToken: 'instagram-token',
-                expiresAt: expect.any(Number)
-            });
+        it('connects Instagram', async () => {
+            const p = await service.connectPlatform('instagram', 'code');
+            expect(p.id).toBe('instagram');
+            expect(p.isConnected).toBe(true);
+            expect(p.accessToken).toBe('ig-token');
         });
 
-        it('should connect YouTube platform', async () => {
-            const result = await authService.connectPlatform('youtube', 'test-code');
-            expect(result).toEqual({
-                id: 'youtube',
-                name: 'Youtube',
-                icon: '/youtube-icon.png',
-                isConnected: true,
-                accessToken: 'youtube-token',
-                refreshToken: 'youtube-refresh',
-                expiresAt: expect.any(Number)
-            });
+        it('connects YouTube with refreshToken', async () => {
+            const p = await service.connectPlatform('youtube', 'code');
+            expect(p.refreshToken).toBe('yt-refresh');
         });
 
-        it('should throw error for unsupported platform', async () => {
-            await expect(authService.connectPlatform('unsupported', 'test-code'))
-                .rejects.toThrow('Unsupported platform: unsupported');
+        it('throws for unsupported platform', async () => {
+            await expect(service.connectPlatform('tiktok', 'code')).rejects.toThrow('Unsupported platform');
         });
     });
 
     describe('checkPlatformLogin', () => {
-        it('should return false for unconnected platform', async () => {
-            const result = await authService.checkPlatformLogin('instagram');
-            expect(result).toBe(false);
-        });
-    });
-
-    describe('disconnectPlatform', () => {
-        it('should disconnect platform', async () => {
-            await expect(authService.disconnectPlatform('instagram')).resolves.not.toThrow();
+        it('returns false (not implemented yet)', async () => {
+            expect(await service.checkPlatformLogin('instagram')).toBe(false);
         });
     });
 
     describe('getCurrentUser', () => {
-        it('should return user profile', async () => {
-            const result = await authService.getCurrentUser('1');
-            expect(result).toEqual({
-                id: '1',
-                email: 'user@example.com',
-                name: 'Test User',
-                platforms: []
+        it('returns user profile when found', async () => {
+            vi.mocked(getUser).mockReturnValue({
+                email: 'u@test.com', password: 'hash', created_at: 0,
+                role: 'user', is_blocked: 0, monthly_downloads: 0, month_reset_at: 0, is_verified: 1, verification_code: null, verification_expires: null
             });
+            const user = await service.getCurrentUser('u@test.com');
+            expect(user.email).toBe('u@test.com');
+        });
+
+        it('throws when user not found', async () => {
+            vi.mocked(getUser).mockReturnValue(undefined);
+            await expect(service.getCurrentUser('ghost@test.com')).rejects.toThrow('User not found');
         });
     });
-}); 
+
+    describe('disconnectPlatform', () => {
+        it('resolves without error', async () => {
+            await expect(service.disconnectPlatform('instagram')).resolves.not.toThrow();
+        });
+    });
+});
