@@ -143,6 +143,32 @@ export function logGuestDownload(ip: string): void {
   stmtLogGuestDownload.run(ip, Date.now());
 }
 
+// --- Seed default users on startup ---
+// Railway has an ephemeral filesystem — DB is wiped on every redeploy.
+// Seed users are recreated from SEED_USERS env var (JSON array) or these defaults.
+// Format: [{"email":"x@y.com","password":"PlainPass1!"}]
+import bcryptjs from 'bcryptjs';
+
+const DEFAULT_SEED_USERS = [
+  { email: 'admin@test.com',  password: 'TestPassword123!' },
+  { email: 'owner@test.com',  password: 'TestPassword123!' },
+  { email: 'tester@test.com', password: 'TestPassword123!' },
+  { email: 'user@test.com',   password: 'TestPassword123!' },
+];
+
+(async () => {
+  let seedUsers = DEFAULT_SEED_USERS;
+  if (process.env.SEED_USERS) {
+    try { seedUsers = JSON.parse(process.env.SEED_USERS); } catch { /* use defaults */ }
+  }
+  for (const u of seedUsers) {
+    if (!userExists(u.email)) {
+      const hash = await bcryptjs.hash(u.password, 10);
+      createUser(u.email, hash);
+    }
+  }
+})();
+
 // Graceful shutdown
 export function closeDatabase(): void {
   db.close();
