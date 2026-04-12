@@ -640,9 +640,68 @@ function extractAudioQualities(formats: any[]): string[] {
 // Downloads the best available image/thumbnail from a post URL using yt-dlp.
 // Used for Instagram photo posts and other image-only content.
 
+/** Fetch Instagram photo URL by scraping og:image from the post page (Googlebot UA) */
+async function fetchInstagramImageUrl(postUrl: string): Promise<{ imageUrl: string; title: string } | null> {
+    try {
+        const cleanPostUrl = postUrl.split('?')[0].replace(/\/$/, '') + '/';
+        const res = await fetch(cleanPostUrl, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
+                'Accept': 'text/html',
+                'Accept-Language': 'en-US,en;q=0.9',
+            },
+        });
+        if (!res.ok) return null;
+        const html = await res.text();
+
+        // Extract og:image
+        const imageMatch = html.match(/property="og:image"\s+content="([^"]+)"/);
+        if (!imageMatch) return null;
+        const imageUrl = imageMatch[1].replace(/&amp;/g, '&');
+
+        // Extract og:title for caption (best-effort)
+        const titleMatch = html.match(/property="og:title"\s+content="([^"]+)"/);
+        const title = titleMatch ? titleMatch[1].replace(/&amp;/g, '&') : 'Instagram Image';
+
+        return { imageUrl, title };
+    } catch {
+        return null;
+    }
+}
+
 async function downloadImage(url: string, platform: string): Promise<DownloadResult> {
     const baseName = `${platform.toLowerCase()}_${Date.now()}`;
     const outputTemplate = path.join(downloadsDir, baseName);
+
+    // Instagram photo posts: yt-dlp errors with "There is no video in this post".
+    // Fall back to fetching the image via the public oEmbed API.
+    if (platform === 'Instagram') {
+        const oembedResult = await fetchInstagramImageUrl(url);
+        if (oembedResult) {
+            const { imageUrl, title } = oembedResult;
+            const finalFilename = `${baseName}.jpg`;
+            const finalPath = path.join(downloadsDir, finalFilename);
+            try {
+                const imgRes = await fetch(imageUrl);
+                if (!imgRes.ok) throw new Error(`Image fetch failed: ${imgRes.status}`);
+                const buffer = Buffer.from(await imgRes.arrayBuffer());
+                fs.writeFileSync(finalPath, buffer);
+                return {
+                    success: true,
+                    downloadUrl: `/downloads/${encodeURIComponent(finalFilename)}`,
+                    filename: finalFilename,
+                    title,
+                    thumbnail: imageUrl,
+                    quality: 'image',
+                };
+            } catch (fetchErr: any) {
+                // Clean up partial file if it exists
+                if (fs.existsSync(finalPath)) fs.unlinkSync(finalPath);
+                // Fall through to yt-dlp attempt below
+                console.warn('[Instagram] oEmbed image fetch failed, trying yt-dlp:', fetchErr.message);
+            }
+        }
+    }
 
     // Use yt-dlp to write the best thumbnail / image, skipping video download
     try {
@@ -1066,9 +1125,34 @@ const infoHandler = async (request: FastifyRequest<{ Querystring: { url: string 
             if (infoError?.killed) {
                 throw new Error('Download timed out. The video may be too large or the server may be busy');
             }
-            const stderr = infoError?.stderr || '';
+            const stderr = (infoError?.stderr || '').toLowerCase();
+            const isPhotoPost = stderr.includes('there is no video in this post') ||
+                stderr.includes('no video could be found') ||
+                stderr.includes('no video in this tweet') ||
+                stderr.includes('no formats found');
+
+            // Instagram / Twitter photo posts: yt-dlp can't handle them.
+            // Fall back to oEmbed to return image info so the UI can offer an image download.
+            if (isPhotoPost && isInsta) {
+                const oembedData = await fetchInstagramImageUrl(cleanUrl);
+                if (oembedData) {
+                    return reply.send({
+                        success: true,
+                        title: oembedData.title,
+                        duration: 0,
+                        thumbnail: oembedData.imageUrl,
+                        author: '',
+                        isImagePost: true,
+                        qualities: [],
+                        qualitiesWithSize: [],
+                        audioQualities: [],
+                    });
+                }
+                throw new Error('No video found in this post. This may be a photo — try selecting "Image" as the download type.');
+            }
+
             if (stderr) {
-                throw new Error(parseYtdlpError(stderr, platformName));
+                throw new Error(parseYtdlpError(infoError.stderr || '', platformName));
             }
             throw new Error('Could not get video information. The video might be private or restricted.');
         }
