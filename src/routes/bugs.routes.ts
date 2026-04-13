@@ -14,7 +14,6 @@ const VALID_STATUSES: BugStatus[] = [
 
 export async function bugsRoutes(fastify: FastifyInstance) {
   // POST /api/bugs — submit a bug report (any authenticated user)
-  // 5 submissions per hour per IP — prevents spam
   fastify.post<{
     Body: { errorText: string; imageBase64?: string };
   }>(
@@ -35,11 +34,9 @@ export async function bugsRoutes(fastify: FastifyInstance) {
         if (typeof imageBase64 !== 'string') {
           return reply.code(400).send({ success: false, error: 'imageBase64 must be a string' });
         }
-        // ~100KB raw → ~140KB base64
         if (imageBase64.length > 145000) {
           return reply.code(400).send({ success: false, error: 'Image too large (max 100KB)' });
         }
-        // Basic validation: must be data URI or raw base64
         if (
           imageBase64.length > 0 &&
           !imageBase64.startsWith('data:image/') &&
@@ -49,7 +46,7 @@ export async function bugsRoutes(fastify: FastifyInstance) {
         }
       }
 
-      const id = createBugReport(email, errorText.trim(), imageBase64);
+      const id = await createBugReport(email, errorText.trim(), imageBase64);
       return reply.code(201).send({ success: true, id });
     }
   );
@@ -59,8 +56,7 @@ export async function bugsRoutes(fastify: FastifyInstance) {
     '/bugs',
     { preHandler: checkRole('admin', 'tester'), config: { rateLimit: { max: 30, timeWindow: '1 minute' } } },
     async (_request, reply) => {
-      const reports = getAllBugReports();
-      // Strip image data from list view for performance — clients fetch full report separately if needed
+      const reports = await getAllBugReports();
       const summary = reports.map(({ image_base64, ...r }) => ({
         ...r,
         has_image: image_base64 !== null && image_base64 !== undefined,
@@ -77,7 +73,7 @@ export async function bugsRoutes(fastify: FastifyInstance) {
       const id = parseInt(request.params.id, 10);
       if (isNaN(id)) return reply.code(400).send({ success: false, error: 'Invalid id' });
 
-      const reports = getAllBugReports();
+      const reports = await getAllBugReports();
       const report = reports.find((r) => r.id === id);
       if (!report) return reply.code(404).send({ success: false, error: 'Bug report not found' });
 
@@ -104,7 +100,7 @@ export async function bugsRoutes(fastify: FastifyInstance) {
         });
       }
 
-      updateBugStatus(id, status);
+      await updateBugStatus(id, status);
       return reply.send({ success: true, message: `Bug #${id} status updated to "${status}"` });
     }
   );

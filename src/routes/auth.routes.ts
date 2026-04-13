@@ -33,17 +33,17 @@ export async function authRoutes(fastify: FastifyInstance) {
         const email = normalizeEmail(rawEmail);
 
         try {
-            if (userExists(email)) {
+            if (await userExists(email)) {
                 // Generic message — avoids leaking which emails are registered
                 return reply.code(409).send({ success: false, message: 'An account with that email already exists or the email is unavailable' });
             }
             const hash = await bcrypt.hash(password, 12);
-            createUser(email, hash);
+            await createUser(email, hash);
 
             // Generate and send verification code
             const code = generateVerificationCode();
             const expiresAt = Date.now() + authConfig.verificationCodeExpiresIn;
-            setVerificationCode(email, code, expiresAt);
+            await setVerificationCode(email, code, expiresAt);
 
             try {
                 await sendVerificationEmail(email, code);
@@ -108,7 +108,7 @@ export async function authRoutes(fastify: FastifyInstance) {
         }
 
         const email = normalizeEmail(rawEmail);
-        const user = getUser(email);
+        const user = await getUser(email);
 
         if (!user) {
             return reply.code(400).send({ success: false, message: 'Invalid verification request' });
@@ -126,7 +126,7 @@ export async function authRoutes(fastify: FastifyInstance) {
             return reply.code(400).send({ success: false, message: 'Invalid verification code' });
         }
 
-        markEmailVerified(email);
+        await markEmailVerified(email);
         return reply.send({ success: true, message: 'Email verified successfully' });
     });
 
@@ -140,7 +140,7 @@ export async function authRoutes(fastify: FastifyInstance) {
         }
 
         const email = normalizeEmail(rawEmail);
-        const user = getUser(email);
+        const user = await getUser(email);
 
         // Generic response to prevent email enumeration
         if (!user || user.is_verified) {
@@ -149,7 +149,7 @@ export async function authRoutes(fastify: FastifyInstance) {
 
         const code = generateVerificationCode();
         const expiresAt = Date.now() + authConfig.verificationCodeExpiresIn;
-        setVerificationCode(email, code, expiresAt);
+        await setVerificationCode(email, code, expiresAt);
 
         try {
             await sendVerificationEmail(email, code);
@@ -200,7 +200,7 @@ export async function authRoutes(fastify: FastifyInstance) {
             }
 
             // Get user
-            const user = getUser(email);
+            const user = await getUser(email);
             if (!user) {
                 return reply.code(401).send({ success: false, message: 'User not found' });
             }
@@ -213,10 +213,10 @@ export async function authRoutes(fastify: FastifyInstance) {
 
             // Hash new password and update
             const newHash = await bcrypt.hash(newPassword, 12);
-            updatePassword(email, newHash);
+            await updatePassword(email, newHash);
 
             // Revoke all refresh tokens (force re-login)
-            revokeAllUserRefreshTokens(email);
+            await revokeAllUserRefreshTokens(email);
 
             return reply.send({ success: true, message: 'Password changed successfully. Please log in again.' });
         } catch (error) {
@@ -237,7 +237,7 @@ export async function authRoutes(fastify: FastifyInstance) {
             }
 
             const email = normalizeEmail(rawEmail);
-            const user = getUser(email);
+            const user = await getUser(email);
 
             if (!user) {
                 // Generic message — avoid leaking which emails exist
@@ -248,7 +248,7 @@ export async function authRoutes(fastify: FastifyInstance) {
             const resetToken = Math.random().toString(36).substring(2, 10).toUpperCase();
             const expiresAt = Date.now() + (15 * 60 * 1000); // 15 minutes
 
-            setPasswordResetToken(email, resetToken, expiresAt);
+            await setPasswordResetToken(email, resetToken, expiresAt);
 
             try {
                 await sendVerificationEmail(email, resetToken, 'password-reset');
@@ -278,7 +278,7 @@ export async function authRoutes(fastify: FastifyInstance) {
             const email = normalizeEmail(rawEmail);
 
             // Validate reset token
-            if (!validatePasswordResetToken(email, resetToken)) {
+            if (!await validatePasswordResetToken(email, resetToken)) {
                 return reply.code(400).send({ success: false, message: 'Invalid or expired reset token' });
             }
 
@@ -290,11 +290,11 @@ export async function authRoutes(fastify: FastifyInstance) {
 
             // Hash and update password
             const newHash = await bcrypt.hash(newPassword, 12);
-            updatePassword(email, newHash);
+            await updatePassword(email, newHash);
 
             // Clear reset token and revoke all refresh tokens
-            clearPasswordResetToken(email);
-            revokeAllUserRefreshTokens(email);
+            await clearPasswordResetToken(email);
+            await revokeAllUserRefreshTokens(email);
 
             return reply.send({ success: true, message: 'Password reset successfully. Please log in with your new password.' });
         } catch (error) {

@@ -21,7 +21,7 @@ export function checkRole(...allowedRoles: UserRole[]) {
     const payload = request.user as JwtPayload;
 
     // Re-check from DB to get live blocked/role status (not just JWT snapshot)
-    const user = getUser(payload.email);
+    const user = await getUser(payload.email);
     if (!user) {
       reply.code(401).send({ success: false, error: 'User not found' });
       return;
@@ -52,7 +52,7 @@ export function requireAuth() {
     }
 
     const payload = request.user as JwtPayload;
-    const user = getUser(payload.email);
+    const user = await getUser(payload.email);
 
     if (!user) {
       reply.code(401).send({ success: false, error: 'User not found' });

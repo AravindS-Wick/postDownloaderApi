@@ -28,18 +28,18 @@ export default async function userRoutes(fastify: FastifyInstance) {
             const payload = request.user as { userId: string; email: string };
             const email = payload.email;
 
-            const user = getUser(email);
+            const user = await getUser(email);
             if (!user) {
                 return reply.code(404).send({ message: 'User not found' });
             }
-            const downloads = getUserDownloads(user.email);
+            const downloads = await getUserDownloads(user.email);
             reply.send({ email: user.email, created: user.created_at, downloads });
         } catch {
             return reply.code(401).send({ message: 'Authentication required' });
         }
     });
 
-    // Log download attempt/completion/consent — 60/min, high because it fires per download step
+    // Log download attempt/completion/consent
     fastify.post<{ Body: LogRequest }>('/log', { config: { rateLimit: { max: 60, timeWindow: '1 minute' } } }, async (request: FastifyRequest<{ Body: LogRequest }>, reply: FastifyReply) => {
         try {
             const { email, type, status, meta, ageConsent } = request.body;
@@ -54,8 +54,14 @@ export default async function userRoutes(fastify: FastifyInstance) {
                 return reply.code(400).send({ message: 'Meta data too large' });
             }
 
-            logDownload({
-                userEmail: email || null,
+            let userRef: string | null = null;
+            if (email) {
+                const user = await getUser(email);
+                userRef = user?.user_ref ?? null;
+            }
+
+            await logDownload({
+                userRef,
                 type,
                 status,
                 meta,

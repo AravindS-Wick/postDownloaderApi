@@ -1,399 +1,213 @@
-import Database from 'better-sqlite3';
-import path from 'path';
-import { fileURLToPath } from 'url';
+/**
+ * DB driver selector.
+ *
+ * DB_DRIVER=sqlite  → better-sqlite3 (default, local dev)
+ * DB_DRIVER=mongo   → MongoDB Atlas  (production / Railway)
+ *
+ * All callers import named functions from this file — the adapter is
+ * transparent. No other file needs to know which DB is in use.
+ */
 
-const __filename_db = fileURLToPath(import.meta.url);
-const __dirname_db = path.dirname(__filename_db);
-// Use DATA_DIR env var when deployed (e.g. Fly.io persistent volume at /data)
-// Falls back to the local db/ directory for development
-const DATA_DIR = process.env.DATA_DIR || path.join(__dirname_db, '../..');
-const DB_PATH = path.join(DATA_DIR, 'db', 'app.db');
+import type { DbAdapter, UserRole, BugStatus } from './types.js';
+export type { UserRole, BugStatus, DbUser, DbDownload, DbBugReport, DbStats } from './types.js';
 
-// Ensure the db directory exists
-import fs from 'fs';
-fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+const driver = (process.env.DB_DRIVER ?? 'sqlite').toLowerCase();
 
-const db = new Database(DB_PATH);
+// Adapter is loaded dynamically so that better-sqlite3 is never imported
+// when running on Railway with DB_DRIVER=mongo (avoids native binding issues).
+let _adapter: DbAdapter;
+let _sqliteAdapter: DbAdapter;
 
-// Enable WAL mode for better concurrent read performance
-db.pragma('journal_mode = WAL');
-
-// Create tables
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    email TEXT PRIMARY KEY,
-    password TEXT NOT NULL,
-    created_at INTEGER NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS downloads (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_email TEXT,
-    type TEXT NOT NULL,
-    status TEXT NOT NULL CHECK(status IN ('attempt', 'complete', 'consent')),
-    meta TEXT,
-    age_consent INTEGER DEFAULT 0,
-    created_at INTEGER NOT NULL
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_downloads_user_email ON downloads(user_email);
-  CREATE INDEX IF NOT EXISTS idx_downloads_created_at ON downloads(created_at DESC);
-
-  CREATE TABLE IF NOT EXISTS guest_downloads (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ip TEXT NOT NULL,
-    created_at INTEGER NOT NULL
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_guest_downloads_ip ON guest_downloads(ip);
-
-  CREATE TABLE IF NOT EXISTS bug_reports (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    reporter_email TEXT NOT NULL,
-    error_text TEXT NOT NULL,
-    image_base64 TEXT,
-    status TEXT NOT NULL DEFAULT 'todo'
-      CHECK(status IN ('todo','inprogress','pr-raised','verify','blocked','fixed')),
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_bug_reports_status ON bug_reports(status);
-  CREATE INDEX IF NOT EXISTS idx_bug_reports_reporter ON bug_reports(reporter_email);
-`);
-
-// Migrate existing users table: add new columns if they don't exist
-// SQLite supports ALTER TABLE ADD COLUMN safely on existing tables
-try { db.exec(`ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'`); } catch {}
-try { db.exec(`ALTER TABLE users ADD COLUMN is_blocked INTEGER NOT NULL DEFAULT 0`); } catch {}
-try { db.exec(`ALTER TABLE users ADD COLUMN monthly_downloads INTEGER NOT NULL DEFAULT 0`); } catch {}
-try { db.exec(`ALTER TABLE users ADD COLUMN month_reset_at INTEGER NOT NULL DEFAULT 0`); } catch {}
-try { db.exec(`ALTER TABLE users ADD COLUMN is_verified INTEGER NOT NULL DEFAULT 0`); } catch {}
-try { db.exec(`ALTER TABLE users ADD COLUMN verification_code TEXT`); } catch {}
-try { db.exec(`ALTER TABLE users ADD COLUMN verification_expires INTEGER`); } catch {}
-try { db.exec(`ALTER TABLE users ADD COLUMN password_reset_token TEXT`); } catch {}
-try { db.exec(`ALTER TABLE users ADD COLUMN password_reset_expires INTEGER`); } catch {}
-
-// Refresh tokens table
-db.exec(`
-  CREATE TABLE IF NOT EXISTS refresh_tokens (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    token TEXT UNIQUE NOT NULL,
-    user_email TEXT NOT NULL,
-    expires_at INTEGER NOT NULL,
-    revoked INTEGER NOT NULL DEFAULT 0,
-    created_at INTEGER NOT NULL,
-    FOREIGN KEY (user_email) REFERENCES users(email) ON DELETE CASCADE
-  );
-  CREATE INDEX IF NOT EXISTS idx_refresh_tokens_token ON refresh_tokens(token);
-  CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user ON refresh_tokens(user_email);
-`);
-
-// --- User helpers ---
-
-export type UserRole = 'admin' | 'owner' | 'tester' | 'user';
-
-export interface DbUser {
-  email: string;
-  password: string;
-  created_at: number;
-  role: UserRole;
-  is_blocked: number;
-  monthly_downloads: number;
-  month_reset_at: number;
-  is_verified: number;
-  verification_code: string | null;
-  verification_expires: number | null;
-}
-
-const stmtGetUser = db.prepare('SELECT * FROM users WHERE email = ?');
-const stmtCreateUser = db.prepare(
-  `INSERT INTO users (email, password, created_at, role, is_blocked, monthly_downloads, month_reset_at)
-   VALUES (?, ?, ?, ?, 0, 0, 0)`
-);
-
-export function getUser(email: string): DbUser | undefined {
-  return stmtGetUser.get(email) as DbUser | undefined;
-}
-
-export function createUser(email: string, passwordHash: string, role: UserRole = 'user'): void {
-  stmtCreateUser.run(email, passwordHash, Date.now(), role);
-}
-
-export function userExists(email: string): boolean {
-  return getUser(email) !== undefined;
-}
-
-export function setUserRole(email: string, role: UserRole): void {
-  db.prepare('UPDATE users SET role = ? WHERE email = ?').run(role, email);
-}
-
-export function setUserBlocked(email: string, blocked: boolean): void {
-  db.prepare('UPDATE users SET is_blocked = ? WHERE email = ?').run(blocked ? 1 : 0, email);
-}
-
-export function deleteUser(email: string): void {
-  db.prepare('DELETE FROM users WHERE email = ?').run(email);
-}
-
-export function getAllUsers(): Omit<DbUser, 'password'>[] {
-  return db.prepare(
-    'SELECT email, created_at, role, is_blocked, monthly_downloads, month_reset_at, is_verified FROM users ORDER BY created_at DESC'
-  ).all() as Omit<DbUser, 'password'>[];
-}
-
-export function incrementMonthlyDownloads(email: string): void {
-  db.prepare('UPDATE users SET monthly_downloads = monthly_downloads + 1 WHERE email = ?').run(email);
-}
-
-export function resetMonthlyDownloadsIfNeeded(email: string): void {
-  const user = getUser(email);
-  if (!user) return;
-  const now = new Date();
-  const resetDate = new Date(user.month_reset_at);
-  if (
-    user.month_reset_at === 0 ||
-    resetDate.getMonth() !== now.getMonth() ||
-    resetDate.getFullYear() !== now.getFullYear()
-  ) {
-    db.prepare('UPDATE users SET monthly_downloads = 0, month_reset_at = ? WHERE email = ?').run(
-      Date.now(),
-      email
-    );
+async function getAdapter(): Promise<DbAdapter> {
+  if (_adapter) return _adapter;
+  if (driver === 'mongo') {
+    try {
+      const { mongoAdapter, connectMongo } = await import('./mongo.adapter.js');
+      await connectMongo();
+      _adapter = mongoAdapter;
+      console.log('Database connected: MongoDB');
+    } catch (mongoErr) {
+      console.warn('MongoDB unavailable, falling back to SQLite:', mongoErr instanceof Error ? mongoErr.message : 'Unknown error');
+      const { sqliteAdapter } = await import('./sqlite.adapter.js');
+      _adapter = sqliteAdapter;
+      console.log('Database connected: SQLite');
+    }
+  } else {
+    const { sqliteAdapter } = await import('./sqlite.adapter.js');
+    _adapter = sqliteAdapter;
+    console.log('Database connected: SQLite');
   }
+  return _adapter;
 }
 
-export function getMonthlyDownloadCount(email: string): number {
-  const user = getUser(email);
-  return user?.monthly_downloads ?? 0;
+async function getSqliteAdapter(): Promise<DbAdapter> {
+  if (_sqliteAdapter) return _sqliteAdapter;
+  const { sqliteAdapter } = await import('./sqlite.adapter.js');
+  _sqliteAdapter = sqliteAdapter;
+  console.log('Guest DB: SQLite');
+  return _sqliteAdapter;
 }
 
-// --- Verification helpers ---
+// Initialised on startup. Awaited by index.ts before the server starts.
+const DEFAULT_SEED_USERS = [
+  { email: 'admin@test.com',  password: 'TestPassword123!', role: 'admin'  as UserRole },
+  { email: 'owner@test.com',  password: 'TestPassword123!', role: 'owner'  as UserRole },
+  { email: 'tester@test.com', password: 'TestPassword123!', role: 'tester' as UserRole },
+  { email: 'user@test.com',   password: 'TestPassword123!', role: 'user'   as UserRole },
+];
 
-export function setVerificationCode(email: string, code: string, expiresAt: number): void {
-  db.prepare('UPDATE users SET verification_code = ?, verification_expires = ? WHERE email = ?')
-    .run(code, expiresAt, email);
+export const dbReady: Promise<void> = (async () => {
+  try {
+    const adapter = await getAdapter();
+    let seedUsers = DEFAULT_SEED_USERS;
+    if (process.env.SEED_USERS) {
+      try { seedUsers = JSON.parse(process.env.SEED_USERS); } catch { /* use defaults */ }
+    }
+    await adapter.seedUsers(seedUsers);
+  } catch (err) {
+    console.warn('Database initialization failed, app will run without persistence:', err instanceof Error ? err.message : 'Unknown error');
+  }
+})();
+
+// ── Forwarding functions (same signatures the rest of the codebase expects) ──
+
+export async function getUser(email: string) {
+  return (await getAdapter()).getUser(email);
+}
+export async function createUser(email: string, passwordHash: string, role?: UserRole) {
+  return (await getAdapter()).createUser(email, passwordHash, role);
+}
+export async function userExists(email: string) {
+  return (await getAdapter()).userExists(email);
+}
+export async function setUserRole(email: string, role: UserRole) {
+  return (await getAdapter()).setUserRole(email, role);
+}
+export async function setUserBlocked(email: string, blocked: boolean) {
+  return (await getAdapter()).setUserBlocked(email, blocked);
+}
+export async function deleteUser(email: string) {
+  return (await getAdapter()).deleteUser(email);
+}
+export async function getAllUsers() {
+  return (await getAdapter()).getAllUsers();
+}
+export async function incrementMonthlyDownloads(email: string) {
+  return (await getAdapter()).incrementMonthlyDownloads(email);
+}
+export async function resetMonthlyDownloadsIfNeeded(email: string) {
+  return (await getAdapter()).resetMonthlyDownloadsIfNeeded(email);
+}
+export async function getMonthlyDownloadCount(email: string) {
+  return (await getAdapter()).getMonthlyDownloadCount(email);
 }
 
-export function markEmailVerified(email: string): void {
-  db.prepare('UPDATE users SET is_verified = 1, verification_code = NULL, verification_expires = NULL WHERE email = ?')
-    .run(email);
+// --- Verification ---
+export async function setVerificationCode(email: string, code: string, expiresAt: number) {
+  return (await getAdapter()).setVerificationCode(email, code, expiresAt);
+}
+export async function markEmailVerified(email: string) {
+  return (await getAdapter()).markEmailVerified(email);
+}
+export async function updatePassword(email: string, hashedPassword: string) {
+  return (await getAdapter()).updatePassword(email, hashedPassword);
+}
+export async function setPasswordResetToken(email: string, token: string, expiresAt: number) {
+  return (await getAdapter()).setPasswordResetToken(email, token, expiresAt);
+}
+export async function getPasswordResetToken(email: string) {
+  return (await getAdapter()).getPasswordResetToken(email);
+}
+export async function validatePasswordResetToken(email: string, token: string) {
+  return (await getAdapter()).validatePasswordResetToken(email, token);
+}
+export async function clearPasswordResetToken(email: string) {
+  return (await getAdapter()).clearPasswordResetToken(email);
 }
 
-export function updatePassword(email: string, hashedPassword: string): void {
-  db.prepare('UPDATE users SET password = ? WHERE email = ?')
-    .run(hashedPassword, email);
+// --- Refresh tokens ---
+export async function storeRefreshToken(token: string, userEmail: string, expiresAt: number) {
+  return (await getAdapter()).storeRefreshToken(token, userEmail, expiresAt);
+}
+export async function getRefreshToken(token: string) {
+  return (await getAdapter()).getRefreshToken(token);
+}
+export async function revokeRefreshToken(token: string) {
+  return (await getAdapter()).revokeRefreshToken(token);
+}
+export async function revokeAllUserRefreshTokens(userEmail: string) {
+  return (await getAdapter()).revokeAllUserRefreshTokens(userEmail);
+}
+export async function cleanExpiredRefreshTokens() {
+  return (await getAdapter()).cleanExpiredRefreshTokens();
 }
 
-export function setPasswordResetToken(email: string, token: string, expiresAt: number): void {
-  db.prepare('UPDATE users SET password_reset_token = ?, password_reset_expires = ? WHERE email = ?')
-    .run(token, expiresAt, email);
-}
-
-export function getPasswordResetToken(email: string): { token: string; expires_at: number } | undefined {
-  return db.prepare('SELECT password_reset_token as token, password_reset_expires as expires_at FROM users WHERE email = ?').get(email) as any;
-}
-
-export function validatePasswordResetToken(email: string, token: string): boolean {
-  const user = getPasswordResetToken(email);
-  if (!user || !user.token) return false;
-  if (user.token !== token) return false;
-  if (Date.now() > user.expires_at) return false;
-  return true;
-}
-
-export function clearPasswordResetToken(email: string): void {
-  db.prepare('UPDATE users SET password_reset_token = NULL, password_reset_expires = NULL WHERE email = ?')
-    .run(email);
-}
-
-// --- Refresh token helpers ---
-
-export function storeRefreshToken(token: string, userEmail: string, expiresAt: number): void {
-  db.prepare('INSERT INTO refresh_tokens (token, user_email, expires_at, created_at) VALUES (?, ?, ?, ?)')
-    .run(token, userEmail, expiresAt, Date.now());
-}
-
-export function getRefreshToken(token: string): { token: string; user_email: string; expires_at: number; revoked: number } | undefined {
-  return db.prepare('SELECT * FROM refresh_tokens WHERE token = ?').get(token) as any;
-}
-
-export function revokeRefreshToken(token: string): void {
-  db.prepare('UPDATE refresh_tokens SET revoked = 1 WHERE token = ?').run(token);
-}
-
-export function revokeAllUserRefreshTokens(userEmail: string): void {
-  db.prepare('UPDATE refresh_tokens SET revoked = 1 WHERE user_email = ?').run(userEmail);
-}
-
-export function cleanExpiredRefreshTokens(): void {
-  db.prepare('DELETE FROM refresh_tokens WHERE expires_at < ? OR revoked = 1').run(Date.now());
-}
-
-// --- Download helpers ---
-
-export interface DbDownload {
-  id: number;
-  user_email: string | null;
-  type: string;
-  status: 'attempt' | 'complete' | 'consent';
-  meta: string; // JSON string
-  age_consent: number;
-  created_at: number;
-}
-
-const stmtLogDownload = db.prepare(
-  'INSERT INTO downloads (user_email, type, status, meta, age_consent, created_at) VALUES (?, ?, ?, ?, ?, ?)'
-);
-const stmtGetUserDownloads = db.prepare(
-  'SELECT * FROM downloads WHERE user_email = ? ORDER BY created_at DESC'
-);
-const stmtGetGuestDownloads = db.prepare(
-  'SELECT * FROM downloads WHERE user_email IS NULL ORDER BY created_at DESC LIMIT ?'
-);
-const stmtDeleteUserDownloads = db.prepare(
-  'DELETE FROM downloads WHERE user_email = ?'
-);
-
-export function logDownload(entry: {
-  userEmail: string | null;
+// --- Downloads ---
+export async function logDownload(entry: {
+  userRef: string | null;
   type: string;
   status: string;
   meta: any;
   ageConsent: boolean;
-}): void {
-  stmtLogDownload.run(
-    entry.userEmail,
-    entry.type,
-    entry.status,
-    JSON.stringify(entry.meta ?? {}),
-    entry.ageConsent ? 1 : 0,
-    Date.now()
-  );
+}) {
+  return (await getAdapter()).logDownload(entry);
+}
+export async function logDownloadForUser(entry: {
+  userRef: string;
+  type: string;
+  status: string;
+  meta: any;
+  ageConsent: boolean;
+}) {
+  return (await getAdapter()).logDownload(entry);
+}
+export async function logGuestDownloadEntry(entry: {
+  userRef: string | null;
+  type: string;
+  status: string;
+  meta: any;
+  ageConsent: boolean;
+}) {
+  return (await getSqliteAdapter()).logDownload(entry);
+}
+export async function getUserDownloads(userRef: string) {
+  return (await getAdapter()).getUserDownloads(userRef);
+}
+export async function getGuestDownloads(limit?: number) {
+  return (await getAdapter()).getGuestDownloads(limit);
+}
+export async function deleteUserDownloads(email: string) {
+  return (await getAdapter()).deleteUserDownloads(email);
 }
 
-export function getUserDownloads(email: string): DbDownload[] {
-  return stmtGetUserDownloads.all(email) as DbDownload[];
+// --- Guest downloads ---
+export async function getGuestDownloadCount(ip: string) {
+  return (await getAdapter()).getGuestDownloadCount(ip);
+}
+export async function logGuestDownload(ip: string) {
+  return (await getAdapter()).logGuestDownload(ip);
 }
 
-export function getGuestDownloads(limit = 1000): DbDownload[] {
-  return stmtGetGuestDownloads.all(limit) as DbDownload[];
+// --- Bug reports ---
+export async function createBugReport(reporterEmail: string, errorText: string, imageBase64?: string) {
+  return (await getAdapter()).createBugReport(reporterEmail, errorText, imageBase64);
+}
+export async function getAllBugReports() {
+  return (await getAdapter()).getAllBugReports();
+}
+export async function updateBugStatus(id: number, status: BugStatus) {
+  return (await getAdapter()).updateBugStatus(id, status);
 }
 
-export function deleteUserDownloads(email: string): void {
-  stmtDeleteUserDownloads.run(email);
+// --- Stats ---
+export async function getDbStats() {
+  return (await getAdapter()).getDbStats();
+}
+export async function clearDownloadLogs() {
+  return (await getAdapter()).clearDownloadLogs();
 }
 
-// --- Guest download helpers (freemium tracking) ---
-
-const stmtCountGuestDownloads = db.prepare(
-  'SELECT COUNT(*) AS count FROM guest_downloads WHERE ip = ?'
-);
-const stmtLogGuestDownload = db.prepare(
-  'INSERT INTO guest_downloads (ip, created_at) VALUES (?, ?)'
-);
-
-export function getGuestDownloadCount(ip: string): number {
-  const row = stmtCountGuestDownloads.get(ip) as { count: number } | undefined;
-  return row?.count ?? 0;
+// --- Lifecycle ---
+export async function closeDatabase() {
+  return (await getAdapter()).close();
 }
-
-export function logGuestDownload(ip: string): void {
-  stmtLogGuestDownload.run(ip, Date.now());
-}
-
-// --- Seed default users on startup ---
-// Railway has an ephemeral filesystem — DB is wiped on every redeploy.
-// Seed users are recreated from SEED_USERS env var (JSON array) or these defaults.
-// Format: [{"email":"x@y.com","password":"PlainPass1!"}]
-import bcryptjs from 'bcryptjs';
-
-const DEFAULT_SEED_USERS: Array<{ email: string; password: string; role?: UserRole }> = [
-  { email: 'admin@test.com',  password: 'TestPassword123!', role: 'admin' },
-  { email: 'owner@test.com',  password: 'TestPassword123!', role: 'owner' },
-  { email: 'tester@test.com', password: 'TestPassword123!', role: 'tester' },
-  { email: 'user@test.com',   password: 'TestPassword123!', role: 'user' },
-];
-
-(async () => {
-  let seedUsers: Array<{ email: string; password: string; role?: UserRole }> = DEFAULT_SEED_USERS;
-  if (process.env.SEED_USERS) {
-    try { seedUsers = JSON.parse(process.env.SEED_USERS); } catch { /* use defaults */ }
-  }
-  for (const u of seedUsers) {
-    if (!userExists(u.email)) {
-      const hash = await bcryptjs.hash(u.password, 10);
-      createUser(u.email, hash, u.role ?? 'user');
-      markEmailVerified(u.email);
-    }
-  }
-})();
-
-// --- DB stats helper ---
-
-export interface DbStats {
-  users: number;
-  downloads: number;
-  bugReports: number;
-  guestDownloads: number;
-}
-
-export function getDbStats(): DbStats {
-  const users = (db.prepare('SELECT COUNT(*) AS count FROM users').get() as { count: number }).count;
-  const downloads = (db.prepare('SELECT COUNT(*) AS count FROM downloads').get() as { count: number }).count;
-  const bugReports = (db.prepare('SELECT COUNT(*) AS count FROM bug_reports').get() as { count: number }).count;
-  const guestDownloads = (db.prepare('SELECT COUNT(*) AS count FROM guest_downloads').get() as { count: number }).count;
-  return { users, downloads, bugReports, guestDownloads };
-}
-
-export function clearDownloadLogs(): void {
-  db.exec('DELETE FROM downloads; DELETE FROM guest_downloads;');
-}
-
-// --- Bug report helpers ---
-
-export type BugStatus = 'todo' | 'inprogress' | 'pr-raised' | 'verify' | 'blocked' | 'fixed';
-
-export interface DbBugReport {
-  id: number;
-  reporter_email: string;
-  error_text: string;
-  image_base64: string | null;
-  status: BugStatus;
-  created_at: number;
-  updated_at: number;
-}
-
-export function createBugReport(
-  reporterEmail: string,
-  errorText: string,
-  imageBase64?: string
-): number {
-  const now = Date.now();
-  const result = db.prepare(
-    `INSERT INTO bug_reports (reporter_email, error_text, image_base64, status, created_at, updated_at)
-     VALUES (?, ?, ?, 'todo', ?, ?)`
-  ).run(reporterEmail, errorText, imageBase64 ?? null, now, now);
-  return result.lastInsertRowid as number;
-}
-
-export function getAllBugReports(): DbBugReport[] {
-  return db.prepare(
-    'SELECT * FROM bug_reports ORDER BY created_at DESC'
-  ).all() as DbBugReport[];
-}
-
-export function updateBugStatus(id: number, status: BugStatus): void {
-  db.prepare('UPDATE bug_reports SET status = ?, updated_at = ? WHERE id = ?').run(
-    status,
-    Date.now(),
-    id
-  );
-}
-
-// Graceful shutdown
-export function closeDatabase(): void {
-  db.close();
-}
-
-export default db;
