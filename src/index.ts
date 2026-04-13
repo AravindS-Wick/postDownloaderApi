@@ -1299,10 +1299,6 @@ app.get('/api/media/status/:downloadId', { config: { rateLimit: { max: 60, timeW
     });
 });
 
-// Health check endpoint for Railway
-app.get('/health', async () => {
-    return { status: 'ok', timestamp: Date.now() };
-});
 
 // Channel posts endpoint — fetch creator posts with pagination (12 per page)
 app.post('/api/channel-posts', {
