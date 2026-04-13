@@ -308,22 +308,23 @@ export function logGuestDownload(ip: string): void {
 // Format: [{"email":"x@y.com","password":"PlainPass1!"}]
 import bcryptjs from 'bcryptjs';
 
-const DEFAULT_SEED_USERS = [
-  { email: 'admin@test.com',  password: 'TestPassword123!' },
-  { email: 'owner@test.com',  password: 'TestPassword123!' },
-  { email: 'tester@test.com', password: 'TestPassword123!' },
-  { email: 'user@test.com',   password: 'TestPassword123!' },
+const DEFAULT_SEED_USERS: Array<{ email: string; password: string; role?: UserRole }> = [
+  { email: 'admin@test.com',  password: 'TestPassword123!', role: 'admin' },
+  { email: 'owner@test.com',  password: 'TestPassword123!', role: 'owner' },
+  { email: 'tester@test.com', password: 'TestPassword123!', role: 'tester' },
+  { email: 'user@test.com',   password: 'TestPassword123!', role: 'user' },
 ];
 
 (async () => {
-  let seedUsers = DEFAULT_SEED_USERS;
+  let seedUsers: Array<{ email: string; password: string; role?: UserRole }> = DEFAULT_SEED_USERS;
   if (process.env.SEED_USERS) {
     try { seedUsers = JSON.parse(process.env.SEED_USERS); } catch { /* use defaults */ }
   }
   for (const u of seedUsers) {
     if (!userExists(u.email)) {
       const hash = await bcryptjs.hash(u.password, 10);
-      createUser(u.email, hash);
+      createUser(u.email, hash, u.role ?? 'user');
+      markEmailVerified(u.email);
     }
   }
 })();
