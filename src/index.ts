@@ -17,7 +17,11 @@ import {
   closeDatabase,
   getGuestDownloadCount,
   logGuestDownload,
+  logDownload,
+  logDownloadForUser,
+  logGuestDownloadEntry,
   getUser,
+  dbReady,
   setUserRole,
   resetMonthlyDownloadsIfNeeded,
   incrementMonthlyDownloads,
@@ -91,11 +95,15 @@ function getYtdlpCookieArgs(): string[] {
 
 /**
  * Extra yt-dlp args for YouTube URLs.
- * --geo-bypass spoofs XFF headers to bypass regional content restrictions
- * that block datacenter IPs (Railway, Fly.io, etc.) without cookies.
+ * --geo-bypass spoofs XFF headers to bypass regional content restrictions.
+ * player_client=android,web uses the Android client first (less bot detection
+ * on datacenter IPs) then falls back to web — fixes 422 errors on Railway/Fly.io.
  */
 function getYouTubeExtraArgs(): string[] {
-    return ['--geo-bypass'];
+    return [
+        '--geo-bypass',
+        '--extractor-args', 'youtube:player_client=android,web',
+    ];
 }
 
 // Freemium config — set FREEMIUM_ENABLED=true in .env to gate downloads after the limit
@@ -954,7 +962,7 @@ app.post('/api/download', {
 
         if (authenticated) {
             const { email } = request.user as JwtPayload;
-            const user = getUser(email);
+            const user = await getUser(email);
 
             if (!user) {
                 return reply.code(401).send({ success: false, error: 'User not found' });
@@ -968,7 +976,7 @@ app.post('/api/download', {
 
             // owner: 50/month
             if (user.role === 'owner') {
-                resetMonthlyDownloadsIfNeeded(email);
+                await resetMonthlyDownloadsIfNeeded(email);
                 const count = user.monthly_downloads;
                 if (count >= 50) {
                     return reply.code(403).send({
@@ -983,7 +991,7 @@ app.post('/api/download', {
 
             // user role: 10 free post-login downloads, then requires upgrade
             if (user.role === 'user') {
-                resetMonthlyDownloadsIfNeeded(email);
+                await resetMonthlyDownloadsIfNeeded(email);
                 const count = user.monthly_downloads;
                 if (count >= 10) {
                     return reply.code(403).send({
@@ -1000,7 +1008,7 @@ app.post('/api/download', {
 
         // Guest (no JWT): enforce freemium limit
         if (!FREEMIUM_ENABLED) return;
-        const count = getGuestDownloadCount(request.ip);
+        const count = await getGuestDownloadCount(request.ip);
         if (count >= FREEMIUM_LIMIT) {
             return reply.code(403).send({
                 success: false,
@@ -1054,19 +1062,40 @@ app.post('/api/download', {
 
         const result = await downloadMedia(url, type as DownloadType, platform, downloadOptions);
 
-        // Track download counts for limiting
+        // Track download metadata and counts
+        let userRef: string | null = null;
         try {
             await request.jwtVerify();
             const { email, role } = request.user as JwtPayload;
+            // Get user_ref from database
+            const user = await getUser(email);
+            userRef = user?.user_ref ?? null;
             // Increment monthly counter for owner and user roles
             if (role === 'owner' || role === 'user') {
-                incrementMonthlyDownloads(email);
+                await incrementMonthlyDownloads(email);
+            }
+            if (userRef) {
+                await logDownloadForUser({
+                    userRef,
+                    type: type as string,
+                    status: 'complete',
+                    meta: { filename: result.filename, platform },
+                    ageConsent: false,
+                });
             }
         } catch {
             // Guest — log for freemium IP tracking
             if (FREEMIUM_ENABLED) {
-                logGuestDownload(request.ip);
+                await logGuestDownload(request.ip);
             }
+            // Guests use SQLite
+            await logGuestDownloadEntry({
+                userRef: null,
+                type: type as string,
+                status: 'complete',
+                meta: { filename: result.filename, platform },
+                ageConsent: false,
+            });
         }
 
         return reply.send(result);
@@ -1124,6 +1153,10 @@ const infoHandler = async (request: FastifyRequest<{ Querystring: { url: string 
         } catch (infoError: any) {
             if (infoError?.killed) {
                 throw new Error('Download timed out. The video may be too large or the server may be busy');
+            }
+            // Log raw stderr so Railway logs show the actual yt-dlp error
+            if (infoError?.stderr) {
+                console.error(`yt-dlp stderr for ${platformName}:`, infoError.stderr);
             }
             const stderr = (infoError?.stderr || '').toLowerCase();
             const isPhotoPost = stderr.includes('there is no video in this post') ||
@@ -1264,6 +1297,11 @@ app.get('/api/media/status/:downloadId', { config: { rateLimit: { max: 60, timeW
         status: 'completed',
         progress: 100,
     });
+});
+
+// Health check endpoint for Railway
+app.get('/health', async () => {
+    return { status: 'ok', timestamp: Date.now() };
 });
 
 // Channel posts endpoint — fetch creator posts with pagination (12 per page)
@@ -1453,7 +1491,7 @@ app.post('/api/channel-posts', {
 
 // Guest remaining downloads endpoint
 app.get('/api/downloads/remaining', { config: { rateLimit: { max: 20, timeWindow: '1 minute' } } }, async (request, reply) => {
-    const used = getGuestDownloadCount(request.ip);
+    const used = await getGuestDownloadCount(request.ip);
     return reply.send({
         freemiumEnabled: FREEMIUM_ENABLED,
         total: FREEMIUM_LIMIT,
@@ -1521,17 +1559,17 @@ let cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
 // ── Server lifecycle ───────────────────────────────────────────────────
 
-function bootstrapRoles() {
+async function bootstrapRoles() {
     const ownerEmail = process.env.OWNER_EMAIL?.trim();
     const adminEmails = (process.env.ADMIN_EMAILS ?? '').split(',').map(e => e.trim()).filter(Boolean);
 
-    if (ownerEmail && getUser(ownerEmail)) {
-        setUserRole(ownerEmail, 'owner');
+    if (ownerEmail && await getUser(ownerEmail)) {
+        await setUserRole(ownerEmail, 'owner');
         console.log(`[bootstrap] ${ownerEmail} → owner`);
     }
     for (const email of adminEmails) {
-        if (email !== ownerEmail && getUser(email)) {
-            setUserRole(email, 'admin');
+        if (email !== ownerEmail && await getUser(email)) {
+            await setUserRole(email, 'admin');
             console.log(`[bootstrap] ${email} → admin`);
         }
     }
@@ -1539,21 +1577,24 @@ function bootstrapRoles() {
 
 const start = async () => {
     try {
+        // Wait for DB adapter to connect and seed users before accepting requests
+        await dbReady;
+
         const port = Number(process.env.PORT ?? 2500);
         const host = process.env.HOST ?? '0.0.0.0';
         await app.listen({ port, host });
         console.log(`Server is running on ${host}:${port}`);
 
-        bootstrapRoles();
+        await bootstrapRoles();
 
         // Start cleanup scheduler
         cleanupTimer = setInterval(() => {
             cleanupOldDownloads();
-            cleanExpiredRefreshTokens();
+            cleanExpiredRefreshTokens().catch(() => {});
         }, CLEANUP_INTERVAL_MS);
         // Run once on startup
         cleanupOldDownloads();
-        cleanExpiredRefreshTokens();
+        await cleanExpiredRefreshTokens();
     } catch (err) {
         app.log.error(err);
         process.exit(1);
@@ -1565,7 +1606,7 @@ async function gracefulShutdown(signal: string) {
     console.log(`Received ${signal}, shutting down gracefully...`);
     if (cleanupTimer) clearInterval(cleanupTimer);
     try {
-        closeDatabase();
+        await closeDatabase();
         await app.close();
         console.log('Server closed');
     } catch (err) {

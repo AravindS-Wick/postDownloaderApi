@@ -16,7 +16,7 @@ export class AuthService {
     }
 
     async login(email: string, password: string): Promise<{ token: string; refreshToken: string; user: UserProfile }> {
-        const storedUser = getUser(email.trim().toLowerCase());
+        const storedUser = await getUser(email.trim().toLowerCase());
 
         if (!storedUser) {
             throw new Error('Invalid credentials');
@@ -48,38 +48,38 @@ export class AuthService {
 
         const refreshToken = crypto.randomBytes(64).toString('hex');
         const refreshExpiresAt = Date.now() + authConfig.refreshTokenExpiresIn;
-        storeRefreshToken(refreshToken, user.email, refreshExpiresAt);
+        await storeRefreshToken(refreshToken, user.email, refreshExpiresAt);
 
         return { token, refreshToken, user };
     }
 
     async refreshAccessToken(refreshTokenValue: string): Promise<{ token: string; refreshToken: string }> {
-        const storedToken = getRefreshToken(refreshTokenValue);
+        const storedToken = await getRefreshToken(refreshTokenValue);
 
         if (!storedToken || storedToken.revoked || storedToken.expires_at < Date.now()) {
             throw new Error('Invalid or expired refresh token');
         }
 
-        const user = getUser(storedToken.user_email);
+        const user = await getUser(storedToken.user_email);
         if (!user || user.is_blocked) {
             throw new Error('User not found or blocked');
         }
 
         // Rotate: revoke old, issue new
-        revokeRefreshToken(refreshTokenValue);
+        await revokeRefreshToken(refreshTokenValue);
 
         const payload: JwtPayload = { userId: user.email, email: user.email, role: user.role };
         const newAccessToken = this.fastify.jwt.sign(payload);
 
         const newRefreshToken = crypto.randomBytes(64).toString('hex');
         const refreshExpiresAt = Date.now() + authConfig.refreshTokenExpiresIn;
-        storeRefreshToken(newRefreshToken, user.email, refreshExpiresAt);
+        await storeRefreshToken(newRefreshToken, user.email, refreshExpiresAt);
 
         return { token: newAccessToken, refreshToken: newRefreshToken };
     }
 
     async logoutUser(email: string): Promise<void> {
-        revokeAllUserRefreshTokens(email);
+        await revokeAllUserRefreshTokens(email);
     }
 
     async getAuthUrl(platform: string): Promise<string> {
@@ -95,15 +95,12 @@ export class AuthService {
                 return this.platformService.getYouTubeAuthUrl(platformConfig);
             case 'twitter':
                 return this.platformService.getTwitterAuthUrl(platformConfig);
-            // case 'tiktok':  // TikTok: coming soon
-            //     return this.platformService.getTikTokAuthUrl(platformConfig);
             default:
                 throw new Error(`Unsupported platform: ${platform}`);
         }
     }
 
     async checkPlatformLogin(platform: string): Promise<boolean> {
-        // TODO: Check if the platform is connected and token is valid
         return false;
     }
 
@@ -124,9 +121,6 @@ export class AuthService {
             case 'twitter':
                 authResponse = await this.platformService.handleTwitterCallback(code, platformConfig, codeVerifier);
                 break;
-            // case 'tiktok':  // TikTok: coming soon
-            //     authResponse = await this.platformService.handleTikTokCallback(code, platformConfig);
-            //     break;
             default:
                 throw new Error(`Unsupported platform: ${platform}`);
         }
@@ -147,7 +141,7 @@ export class AuthService {
     }
 
     async getCurrentUser(userId: string): Promise<UserProfile> {
-        const storedUser = getUser(userId);
+        const storedUser = await getUser(userId);
 
         if (storedUser) {
             return {

@@ -21,7 +21,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
     preHandler: checkRole('admin'),
     config: { rateLimit: adminLimit },
   }, async (_request, reply) => {
-    const users = getAllUsers();
+    const users = await getAllUsers();
     fastify.log.info({ event: 'admin_list_users', ip: _request.ip }, 'Admin listed users');
     return reply.send({ success: true, users });
   });
@@ -35,8 +35,8 @@ export async function adminRoutes(fastify: FastifyInstance) {
       if (!email) return reply.code(400).send({ success: false, error: 'Email required' });
 
       fastify.log.warn({ event: 'admin_delete_user', target: email, ip: request.ip }, 'Admin deleted user');
-      deleteUserDownloads(email);
-      deleteUser(email);
+      await deleteUserDownloads(email);
+      await deleteUser(email);
       return reply.send({ success: true, message: `User ${email} removed` });
     }
   );
@@ -54,7 +54,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
       }
 
       fastify.log.warn({ event: 'admin_block_user', target: email, blocked, ip: request.ip }, `Admin ${blocked ? 'blocked' : 'unblocked'} user`);
-      setUserBlocked(email, blocked);
+      await setUserBlocked(email, blocked);
       return reply.send({
         success: true,
         message: `User ${email} ${blocked ? 'blocked' : 'unblocked'}`,
@@ -67,7 +67,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
     preHandler: checkRole('admin'),
     config: { rateLimit: adminLimit },
   }, async (_request, reply) => {
-    const stats = getDbStats();
+    const stats = await getDbStats();
     return reply.send({ success: true, stats });
   });
 
@@ -77,7 +77,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
     config: { rateLimit: adminWriteLimit },
   }, async (request, reply) => {
     fastify.log.warn({ event: 'admin_clear_logs', ip: request.ip }, 'Admin cleared download logs');
-    clearDownloadLogs();
+    await clearDownloadLogs();
     return reply.send({ success: true, message: 'Download logs cleared' });
   });
 
@@ -90,13 +90,12 @@ export async function adminRoutes(fastify: FastifyInstance) {
       if (!email) return reply.code(400).send({ success: false, error: 'Email required' });
 
       fastify.log.info({ event: 'admin_approve_owner', target: email, ip: request.ip }, 'Admin approved owner role');
-      setUserRole(email, 'owner');
+      await setUserRole(email, 'owner');
       return reply.send({ success: true, message: `${email} confirmed as owner` });
     }
   );
 
   // POST /api/admin/restart — restart the API process
-  // The process manager (Railway/Fly.io/nodemon) will restart it automatically
   fastify.post('/restart', {
     preHandler: checkRole('admin'),
     config: { rateLimit: restartLimit },

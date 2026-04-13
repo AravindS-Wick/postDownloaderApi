@@ -25,12 +25,16 @@
     "dotenv": "^16.3.1",
     "fastify": "^4.24.3",
     "file-uri-to-path": "^2.0.0",
+    "mongoose": "^9.4.1",
     "nodemailer": "^8.0.5",
     "pino-pretty": "^10.2.3",
     "resend": "^6.10.0"
   },
   "pnpm": {
-    "onlyBuiltDependencies": ["better-sqlite3", "esbuild"]
+    "onlyBuiltDependencies": [
+      "better-sqlite3",
+      "esbuild"
+    ]
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
