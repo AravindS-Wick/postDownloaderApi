@@ -1299,11 +1299,6 @@ app.get('/api/media/status/:downloadId', { config: { rateLimit: { max: 60, timeW
     });
 });
 
-// Health check endpoint for Railway
-app.get('/health', async () => {
-    return { status: 'ok', timestamp: Date.now() };
-});
-
 // Channel posts endpoint — fetch creator posts with pagination (12 per page)
 app.post('/api/channel-posts', {
     config: {
@@ -1507,25 +1502,7 @@ app.get('/', { config: { rateLimit: { max: 30, timeWindow: '1 minute' } } }, asy
 
 // Health check route
 app.get('/health', { config: { rateLimit: { max: 20, timeWindow: '1 minute' } } }, async () => {
-    const checks: Record<string, string> = { status: 'ok' };
-
-    try {
-        await fs.promises.access(downloadsDir, fs.constants.W_OK);
-        checks.downloadsDir = 'writable';
-    } catch {
-        checks.downloadsDir = 'not writable';
-        checks.status = 'degraded';
-    }
-
-    try {
-        await execFileAsync('yt-dlp', ['--version']);
-        checks.ytDlp = 'available';
-    } catch {
-        checks.ytDlp = 'not found';
-        checks.status = 'degraded';
-    }
-
-    return checks;
+    return { status: 'ok', timestamp: Date.now() };
 });
 
 // ── Download cleanup scheduler ─────────────────────────────────────────
