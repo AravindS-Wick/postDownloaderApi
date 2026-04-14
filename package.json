@@ -12,12 +12,12 @@
     "test:ui": "vitest --ui"
   },
   "dependencies": {
-    "@fastify/cors": "^9.0.0",
+    "@fastify/cors": "^11.2.0",
     "@fastify/jwt": "^10.0.0",
-    "@fastify/rate-limit": "^10.0.0",
-    "@fastify/static": "^7.0.0",
-    "@fastify/swagger": "^9.0.0",
-    "@fastify/swagger-ui": "^2.0.0",
+    "@fastify/rate-limit": "^10.3.0",
+    "@fastify/static": "^9.1.0",
+    "@fastify/swagger": "^9.7.0",
+    "@fastify/swagger-ui": "^5.2.5",
     "@types/bcryptjs": "^2.4.6",
     "axios": "^1.8.2",
     "bcryptjs": "^2.4.3",
@@ -29,12 +29,6 @@
     "nodemailer": "^8.0.5",
     "pino-pretty": "^10.2.3",
     "resend": "^6.10.0"
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "better-sqlite3",
-      "esbuild"
-    ]
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
