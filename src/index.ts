@@ -83,13 +83,45 @@ if (process.env.COOKIES_CONTENT) {
         : path.resolve(process.cwd(), _rawCookiesFile);
 }
 
-function getYtdlpCookieArgs(): string[] {
-    if (COOKIES_FROM_BROWSER) {
-        return ['--cookies-from-browser', COOKIES_FROM_BROWSER];
+function getYtdlpCookieArgs(platform?: string): string[] {
+    let cookiesContent = '';
+
+    // Priority 1: Platform-specific cookies (YOUTUBE_COOKIES, INSTAGRAM_COOKIES, TWITTER_COOKIES)
+    if (platform === 'youtube' && process.env.YOUTUBE_COOKIES) {
+        cookiesContent = process.env.YOUTUBE_COOKIES;
+    } else if (platform === 'instagram' && process.env.INSTAGRAM_COOKIES) {
+        cookiesContent = process.env.INSTAGRAM_COOKIES;
+    } else if (platform === 'twitter' && process.env.TWITTER_COOKIES) {
+        cookiesContent = process.env.TWITTER_COOKIES;
     }
-    if (COOKIES_FILE && fs.existsSync(COOKIES_FILE)) {
-        return ['--cookies', COOKIES_FILE];
+
+    // Priority 2: Generic COOKIES_CONTENT (fallback for all platforms)
+    if (!cookiesContent && process.env.COOKIES_CONTENT) {
+        cookiesContent = process.env.COOKIES_CONTENT;
     }
+
+    // Write to temp file if we have content
+    if (cookiesContent) {
+        try {
+            // Replace escaped newlines with actual newlines (Railway sends \n as literal string)
+            const normalizedContent = cookiesContent.replace(/\\n/g, '\n');
+            fs.writeFileSync('/tmp/cookies.txt', normalizedContent);
+            return ['--cookies', '/tmp/cookies.txt'];
+        } catch (err) {
+            console.error('Failed to write cookies file:', err);
+        }
+    }
+
+    // Priority 3: COOKIES_FILE (path to existing file - local development)
+    if (process.env.COOKIES_FILE && fs.existsSync(process.env.COOKIES_FILE)) {
+        return ['--cookies', process.env.COOKIES_FILE];
+    }
+
+    // Priority 4: COOKIES_FROM_BROWSER (browser string - local dev only)
+    if (process.env.COOKIES_FROM_BROWSER) {
+        return ['--cookies-from-browser', process.env.COOKIES_FROM_BROWSER];
+    }
+
     return [];
 }
 
@@ -748,7 +780,7 @@ async function downloadImage(url: string, platform: string): Promise<DownloadRes
     let thumbnail = '';
     try {
         const { stdout } = await execFileAsync('yt-dlp', [
-            url, '--dump-json', '--no-warnings', ...getYtdlpCookieArgs(),
+            url, '--dump-json', '--no-warnings', ...getYtdlpCookieArgs(platform),
         ], { timeout: YTDLP_TIMEOUT_MS, maxBuffer: YTDLP_MAX_BUFFER });
         const info = JSON.parse(stdout);
         title = info.title || title;
@@ -794,7 +826,7 @@ async function downloadMedia(
             const { stdout: infoJson } = await execFileAsync('yt-dlp', [
                 cleanUrl, '--dump-json', '--no-warnings',
                 ...(isYouTubeUrl(cleanUrl) ? getYouTubeExtraArgs() : []),
-                ...getYtdlpCookieArgs(),
+                ...getYtdlpCookieArgs(platform.toLowerCase()),
             ], { timeout: YTDLP_TIMEOUT_MS, maxBuffer: YTDLP_MAX_BUFFER });
             videoInfo = JSON.parse(infoJson);
             console.log(`${platform} info retrieved successfully`);
@@ -825,7 +857,7 @@ async function downloadMedia(
             '--progress',
             '--newline',
             ...(isYouTubeUrl(cleanUrl) ? getYouTubeExtraArgs() : []),
-            ...getYtdlpCookieArgs(),
+            ...getYtdlpCookieArgs(platform.toLowerCase()),
         ];
 
         // For video with adaptive formats (video+audio merge), ensure mp4 output
@@ -1147,7 +1179,7 @@ const infoHandler = async (request: FastifyRequest<{ Querystring: { url: string 
             const { stdout: infoJson } = await execFileAsync('yt-dlp', [
                 cleanUrl, '--dump-json', '--no-warnings',
                 ...(isYT ? getYouTubeExtraArgs() : []),
-                ...getYtdlpCookieArgs(),
+                ...getYtdlpCookieArgs(platformName.toLowerCase()),
             ], { timeout: YTDLP_TIMEOUT_MS, maxBuffer: YTDLP_MAX_BUFFER });
             videoInfo = JSON.parse(infoJson);
         } catch (infoError: any) {
@@ -1503,6 +1535,119 @@ app.get('/', { config: { rateLimit: { max: 30, timeWindow: '1 minute' } } }, asy
 // Health check route
 app.get('/health', { config: { rateLimit: { max: 20, timeWindow: '1 minute' } } }, async () => {
     return { status: 'ok', timestamp: Date.now() };
+});
+
+// Comprehensive health check with platform validation
+app.get('/health/detailed', { config: { rateLimit: { max: 5, timeWindow: '1 minute' } } }, async (_request, reply) => {
+    try {
+        const results: any = {
+            status: 'checking',
+            timestamp: new Date().toISOString(),
+            services: {
+                api: 'ok',
+                database: 'unknown',
+                ytdlp: 'unknown',
+                cookies: 'unchecked'
+            },
+            platforms: {
+                youtube: { status: 'untested', details: '' },
+                instagram: { status: 'untested', details: '' },
+                twitter: { status: 'untested', details: '' }
+            }
+        };
+
+        // Check cookies
+        if (process.env.COOKIES_CONTENT) {
+            results.services.cookies = 'configured';
+        } else if (process.env.COOKIES_FILE) {
+            results.services.cookies = 'configured (file path)';
+        } else {
+            results.services.cookies = 'missing (YouTube will be limited)';
+        }
+
+        // Quick yt-dlp version check
+        try {
+            const { stdout } = await execFileAsync('yt-dlp', ['--version'], { timeout: 5000, maxBuffer: 1024 });
+            results.services.ytdlp = `ok (${stdout.trim()})`;
+        } catch (err) {
+            results.services.ytdlp = 'error or not found';
+        }
+
+        // Test platform detection (without actual download)
+        const testUrls: Record<string, string> = {
+            youtube: 'https://youtu.be/1Z58KqDkLy0',
+            instagram: 'https://www.instagram.com/reel/DQj3Ba5iPgo/',
+            twitter: 'https://x.com/ZohranKMamdani/status/1985899742044262838'
+        };
+
+        // Quick validation for each platform (just fetch info, don't download)
+        for (const [platform, url] of Object.entries(testUrls)) {
+            try {
+                const { stdout } = await execFileAsync('yt-dlp', [
+                    url,
+                    '--dump-json',
+                    '--no-warnings',
+                    '--skip-download',
+                    '-f', 'bestvideo',
+                    ...(platform === 'youtube' ? getYouTubeExtraArgs() : []),
+                    ...getYtdlpCookieArgs(platform),
+                ], { timeout: 10000, maxBuffer: 10 * 1024 * 1024 });
+
+                const info = JSON.parse(stdout);
+                results.platforms[platform as keyof typeof results.platforms] = {
+                    status: 'ok',
+                    details: `Title: ${(info.title || 'N/A').substring(0, 50)}...`
+                };
+            } catch (err: any) {
+                const errorMsg = err.stderr ? err.stderr.toLowerCase() : (err.message || 'unknown');
+                if (errorMsg.includes('sign in to confirm') || errorMsg.includes('bot')) {
+                    results.platforms[platform as keyof typeof results.platforms] = {
+                        status: 'auth_required',
+                        details: 'YouTube bot detection. Check COOKIES_CONTENT.'
+                    };
+                } else if (errorMsg.includes('age-restrict')) {
+                    results.platforms[platform as keyof typeof results.platforms] = {
+                        status: 'partial',
+                        details: 'Age-restricted content detected'
+                    };
+                } else if (errorMsg.includes('unavailable') || errorMsg.includes('not available')) {
+                    results.platforms[platform as keyof typeof results.platforms] = {
+                        status: 'unavailable',
+                        details: 'Content unavailable (may be deleted or regional)'
+                    };
+                } else {
+                    results.platforms[platform as keyof typeof results.platforms] = {
+                        status: 'error',
+                        details: errorMsg.substring(0, 100)
+                    };
+                }
+            }
+        }
+
+        results.status = 'ok';
+        return results;
+    } catch (error) {
+        return reply.code(500).send({
+            status: 'error',
+            timestamp: new Date().toISOString(),
+            error: clientErrorMessage(error)
+        });
+    }
+});
+
+// Simple platform check endpoint
+app.get('/health/platforms', async () => {
+    return {
+        status: 'ok',
+        supported: {
+            youtube: { status: 'supported', formats: 'video, shorts' },
+            instagram: { status: 'supported', formats: 'reels, carousel' },
+            twitter: { status: 'supported', formats: 'videos' },
+            tiktok: { status: 'coming_soon' },
+            facebook: { status: 'coming_soon' }
+        },
+        timestamp: new Date().toISOString()
+    };
 });
 
 // ── Download cleanup scheduler ─────────────────────────────────────────
