@@ -1568,55 +1568,62 @@ app.get('/health/detailed', { config: { rateLimit: { max: 5, timeWindow: '1 minu
             results.services.ytdlp = 'error or not found';
         }
 
-        // Test platform detection (without actual download)
-        const testUrls: Record<string, string> = {
-            youtube: 'https://youtu.be/1Z58KqDkLy0',
-            instagram: 'https://www.instagram.com/reel/DQj3Ba5iPgo/',
-            twitter: 'https://x.com/ZohranKMamdani/status/1985899742044262838'
+        // Test ALL 6 real URLs from test suite
+        const testUrls: Record<string, string[]> = {
+            youtube: [
+                'https://youtu.be/1Z58KqDkLy0',
+                'https://youtube.com/shorts/pIHvoXkwmq4'
+            ],
+            instagram: [
+                'https://www.instagram.com/reel/DQj3Ba5iPgo/',
+                'https://www.instagram.com/reel/DXBIT_WTvcw/',
+                'https://www.instagram.com/p/DXD-osEiRRk/'
+            ],
+            twitter: [
+                'https://x.com/ZohranKMamdani/status/1985899742044262838'
+            ]
         };
 
-        // Quick validation for each platform (just fetch info, don't download)
-        for (const [platform, url] of Object.entries(testUrls)) {
-            try {
-                const { stdout } = await execFileAsync('yt-dlp', [
-                    url,
-                    '--dump-json',
-                    '--no-warnings',
-                    '--skip-download',
-                    '-f', 'bestvideo',
-                    ...getYtdlpCookieArgs(platform),
-                    ...(platform === 'youtube' ? getYouTubeExtraArgs() : []),
-                ], { timeout: 10000, maxBuffer: 10 * 1024 * 1024 });
+        // Test ALL URLs for each platform
+        for (const [platform, urls] of Object.entries(testUrls)) {
+            let allOk = true;
+            let lastDetails = '';
+            
+            for (const url of urls) {
+                try {
+                    const { stdout } = await execFileAsync('yt-dlp', [
+                        url,
+                        '--dump-json',
+                        '--no-warnings',
+                        '--skip-download',
+                        '-f', 'bestvideo',
+                        ...getYtdlpCookieArgs(platform),
+                        ...(platform === 'youtube' ? getYouTubeExtraArgs() : []),
+                    ], { timeout: 10000, maxBuffer: 10 * 1024 * 1024 });
 
-                const info = JSON.parse(stdout);
-                results.platforms[platform as keyof typeof results.platforms] = {
-                    status: 'ok',
-                    details: `Title: ${(info.title || 'N/A').substring(0, 50)}...`
-                };
-            } catch (err: any) {
-                const errorMsg = err.stderr ? err.stderr.toLowerCase() : (err.message || 'unknown');
-                if (errorMsg.includes('sign in to confirm') || errorMsg.includes('bot')) {
-                    results.platforms[platform as keyof typeof results.platforms] = {
-                        status: 'auth_required',
-                        details: 'YouTube bot detection. Check COOKIES_CONTENT.'
-                    };
-                } else if (errorMsg.includes('age-restrict')) {
-                    results.platforms[platform as keyof typeof results.platforms] = {
-                        status: 'partial',
-                        details: 'Age-restricted content detected'
-                    };
-                } else if (errorMsg.includes('unavailable') || errorMsg.includes('not available')) {
-                    results.platforms[platform as keyof typeof results.platforms] = {
-                        status: 'unavailable',
-                        details: 'Content unavailable (may be deleted or regional)'
-                    };
-                } else {
-                    results.platforms[platform as keyof typeof results.platforms] = {
-                        status: 'error',
-                        details: errorMsg.substring(0, 100)
-                    };
+                    const info = JSON.parse(stdout);
+                    lastDetails = `OK: ${(info.title || 'N/A').substring(0, 40)}...`;
+                } catch (err: any) {
+                    allOk = false;
+                    const errorMsg = err.stderr ? err.stderr.toLowerCase() : (err.message || 'unknown');
+                    if (errorMsg.includes('sign in to confirm') || errorMsg.includes('bot')) {
+                        lastDetails = 'FAIL: Bot detection. Check COOKIES_CONTENT.';
+                        break;
+                    } else if (errorMsg.includes('age-restrict')) {
+                        lastDetails = 'PARTIAL: Age-restricted content';
+                    } else if (errorMsg.includes('unavailable') || errorMsg.includes('not available')) {
+                        lastDetails = `UNAVAILABLE: ${url}`;
+                    } else {
+                        lastDetails = `ERROR: ${errorMsg.substring(0, 80)}`;
+                    }
                 }
             }
+            
+            results.platforms[platform as keyof typeof results.platforms] = {
+                status: allOk ? 'ok' : lastDetails.includes('PARTIAL') ? 'partial' : 'error',
+                tests: urls.length,
+                details: lastDetails
+            };
         }
 
         results.status = 'ok';
