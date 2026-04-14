@@ -69,19 +69,8 @@ const CLEANUP_MAX_AGE_MS = 60 * 60 * 1000; // 1 hour
 // Option 3: COOKIES_CONTENT=<full contents of cookies.txt>  (for Railway/cloud deployments)
 const COOKIES_FROM_BROWSER = process.env.COOKIES_FROM_BROWSER || '';
 
-// If COOKIES_CONTENT env var is set (cloud deployment), write it to a temp file once at startup
-let COOKIES_FILE = '';
-const _rawCookiesFile = process.env.COOKIES_FILE || '';
-if (process.env.COOKIES_CONTENT) {
-    const tmpCookiesPath = path.join('/tmp', 'cookies.txt');
-    fs.writeFileSync(tmpCookiesPath, process.env.COOKIES_CONTENT, 'utf8');
-    COOKIES_FILE = tmpCookiesPath;
-    console.log('Cookies loaded from COOKIES_CONTENT env var →', tmpCookiesPath);
-} else if (_rawCookiesFile) {
-    COOKIES_FILE = path.isAbsolute(_rawCookiesFile)
-        ? _rawCookiesFile
-        : path.resolve(process.cwd(), _rawCookiesFile);
-}
+// COOKIES_FILE is deprecated. Use getYtdlpCookieArgs() which handles all cookie formats properly.
+// All cookie handling is now done dynamically per-request in getYtdlpCookieArgs()
 
 function getYtdlpCookieArgs(platform?: string): string[] {
     let cookiesContent = '';
@@ -135,6 +124,9 @@ function getYouTubeExtraArgs(): string[] {
     return [
         '--geo-bypass',
         '--extractor-args', 'youtube:player_client=android,web',
+        '--no-check-certificate',
+        '--user-agent', 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
+        '--extractor-args', 'youtube:skip=dash',
     ];
 }
 
@@ -753,6 +745,7 @@ async function downloadImage(url: string, platform: string): Promise<DownloadRes
             '-o', outputTemplate,
             '--no-warnings',
             ...getYtdlpCookieArgs(),
+            ...(isYouTubeUrl(url) ? getYouTubeExtraArgs() : []),
         ], { timeout: YTDLP_TIMEOUT_MS, maxBuffer: YTDLP_MAX_BUFFER });
     } catch (dlError: any) {
         if (dlError?.killed) throw new Error('Download timed out');
@@ -780,7 +773,9 @@ async function downloadImage(url: string, platform: string): Promise<DownloadRes
     let thumbnail = '';
     try {
         const { stdout } = await execFileAsync('yt-dlp', [
-            url, '--dump-json', '--no-warnings', ...getYtdlpCookieArgs(platform),
+            url, '--dump-json', '--no-warnings',
+            ...getYtdlpCookieArgs(platform.toLowerCase()),
+            ...(isYouTubeUrl(url) ? getYouTubeExtraArgs() : []),
         ], { timeout: YTDLP_TIMEOUT_MS, maxBuffer: YTDLP_MAX_BUFFER });
         const info = JSON.parse(stdout);
         title = info.title || title;
@@ -825,8 +820,8 @@ async function downloadMedia(
         try {
             const { stdout: infoJson } = await execFileAsync('yt-dlp', [
                 cleanUrl, '--dump-json', '--no-warnings',
-                ...(isYouTubeUrl(cleanUrl) ? getYouTubeExtraArgs() : []),
                 ...getYtdlpCookieArgs(platform.toLowerCase()),
+                ...(isYouTubeUrl(cleanUrl) ? getYouTubeExtraArgs() : []),
             ], { timeout: YTDLP_TIMEOUT_MS, maxBuffer: YTDLP_MAX_BUFFER });
             videoInfo = JSON.parse(infoJson);
             console.log(`${platform} info retrieved successfully`);
@@ -856,8 +851,8 @@ async function downloadMedia(
             '--no-warnings',
             '--progress',
             '--newline',
-            ...(isYouTubeUrl(cleanUrl) ? getYouTubeExtraArgs() : []),
             ...getYtdlpCookieArgs(platform.toLowerCase()),
+            ...(isYouTubeUrl(cleanUrl) ? getYouTubeExtraArgs() : []),
         ];
 
         // For video with adaptive formats (video+audio merge), ensure mp4 output
@@ -1178,8 +1173,8 @@ const infoHandler = async (request: FastifyRequest<{ Querystring: { url: string 
         try {
             const { stdout: infoJson } = await execFileAsync('yt-dlp', [
                 cleanUrl, '--dump-json', '--no-warnings',
-                ...(isYT ? getYouTubeExtraArgs() : []),
                 ...getYtdlpCookieArgs(platformName.toLowerCase()),
+                ...(isYT ? getYouTubeExtraArgs() : []),
             ], { timeout: YTDLP_TIMEOUT_MS, maxBuffer: YTDLP_MAX_BUFFER });
             videoInfo = JSON.parse(infoJson);
         } catch (infoError: any) {
@@ -1427,8 +1422,8 @@ app.post('/api/channel-posts', {
                 // It's a video URL — extract channel_url with lightweight --print
                 const { stdout: channelUrl } = await execFileAsync('yt-dlp', [
                     normalizedUrl, '--print', 'channel_url', '--no-warnings', '--no-download', '--playlist-items', '1',
-                    ...getYouTubeExtraArgs(),
                     ...getYtdlpCookieArgs(),
+                    ...getYouTubeExtraArgs(),
                 ], { timeout: YTDLP_TIMEOUT_MS, maxBuffer: 1024 * 1024 });
 
                 creatorUrl = channelUrl.trim();
@@ -1452,8 +1447,8 @@ app.post('/api/channel-posts', {
             '--dump-json',
             '--no-warnings',
             '--playlist-items', `${startItem}:${fetchEnd}`,
-            ...getYouTubeExtraArgs(),
             ...getYtdlpCookieArgs(),
+            ...getYouTubeExtraArgs(),
         ];
 
         let stdout: string;
@@ -1573,55 +1568,62 @@ app.get('/health/detailed', { config: { rateLimit: { max: 5, timeWindow: '1 minu
             results.services.ytdlp = 'error or not found';
         }
 
-        // Test platform detection (without actual download)
-        const testUrls: Record<string, string> = {
-            youtube: 'https://youtu.be/1Z58KqDkLy0',
-            instagram: 'https://www.instagram.com/reel/DQj3Ba5iPgo/',
-            twitter: 'https://x.com/ZohranKMamdani/status/1985899742044262838'
+        // Test ALL 6 real URLs from test suite
+        const testUrls: Record<string, string[]> = {
+            youtube: [
+                'https://youtu.be/1Z58KqDkLy0',
+                'https://youtube.com/shorts/pIHvoXkwmq4'
+            ],
+            instagram: [
+                'https://www.instagram.com/reel/DQj3Ba5iPgo/',
+                'https://www.instagram.com/reel/DXBIT_WTvcw/',
+                'https://www.instagram.com/p/DXD-osEiRRk/'
+            ],
+            twitter: [
+                'https://x.com/ZohranKMamdani/status/1985899742044262838'
+            ]
         };
 
-        // Quick validation for each platform (just fetch info, don't download)
-        for (const [platform, url] of Object.entries(testUrls)) {
-            try {
-                const { stdout } = await execFileAsync('yt-dlp', [
-                    url,
-                    '--dump-json',
-                    '--no-warnings',
-                    '--skip-download',
-                    '-f', 'bestvideo',
-                    ...(platform === 'youtube' ? getYouTubeExtraArgs() : []),
-                    ...getYtdlpCookieArgs(platform),
-                ], { timeout: 10000, maxBuffer: 10 * 1024 * 1024 });
+        // Test ALL URLs for each platform
+        for (const [platform, urls] of Object.entries(testUrls)) {
+            let allOk = true;
+            let lastDetails = '';
+            
+            for (const url of urls) {
+                try {
+                    const { stdout } = await execFileAsync('yt-dlp', [
+                        url,
+                        '--dump-json',
+                        '--no-warnings',
+                        '--skip-download',
+                        '-f', 'bestvideo',
+                        ...getYtdlpCookieArgs(platform),
+                        ...(platform === 'youtube' ? getYouTubeExtraArgs() : []),
+                    ], { timeout: 10000, maxBuffer: 10 * 1024 * 1024 });
 
-                const info = JSON.parse(stdout);
-                results.platforms[platform as keyof typeof results.platforms] = {
-                    status: 'ok',
-                    details: `Title: ${(info.title || 'N/A').substring(0, 50)}...`
-                };
-            } catch (err: any) {
-                const errorMsg = err.stderr ? err.stderr.toLowerCase() : (err.message || 'unknown');
-                if (errorMsg.includes('sign in to confirm') || errorMsg.includes('bot')) {
-                    results.platforms[platform as keyof typeof results.platforms] = {
-                        status: 'auth_required',
-                        details: 'YouTube bot detection. Check COOKIES_CONTENT.'
-                    };
-                } else if (errorMsg.includes('age-restrict')) {
-                    results.platforms[platform as keyof typeof results.platforms] = {
-                        status: 'partial',
-                        details: 'Age-restricted content detected'
-                    };
-                } else if (errorMsg.includes('unavailable') || errorMsg.includes('not available')) {
-                    results.platforms[platform as keyof typeof results.platforms] = {
-                        status: 'unavailable',
-                        details: 'Content unavailable (may be deleted or regional)'
-                    };
-                } else {
-                    results.platforms[platform as keyof typeof results.platforms] = {
-                        status: 'error',
-                        details: errorMsg.substring(0, 100)
-                    };
+                    const info = JSON.parse(stdout);
+                    lastDetails = `OK: ${(info.title || 'N/A').substring(0, 40)}...`;
+                } catch (err: any) {
+                    allOk = false;
+                    const errorMsg = err.stderr ? err.stderr.toLowerCase() : (err.message || 'unknown');
+                    if (errorMsg.includes('sign in to confirm') || errorMsg.includes('bot')) {
+                        lastDetails = 'FAIL: Bot detection. Check COOKIES_CONTENT.';
+                        break;
+                    } else if (errorMsg.includes('age-restrict')) {
+                        lastDetails = 'PARTIAL: Age-restricted content';
+                    } else if (errorMsg.includes('unavailable') || errorMsg.includes('not available')) {
+                        lastDetails = `UNAVAILABLE: ${url}`;
+                    } else {
+                        lastDetails = `ERROR: ${errorMsg.substring(0, 80)}`;
+                    }
                 }
             }
+            
+            results.platforms[platform as keyof typeof results.platforms] = {
+                status: allOk ? 'ok' : lastDetails.includes('PARTIAL') ? 'partial' : 'error',
+                tests: urls.length,
+                details: lastDetails
+            };
         }
 
         results.status = 'ok';
