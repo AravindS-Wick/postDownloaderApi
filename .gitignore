@@ -14,3 +14,6 @@ coverage/
 /test-downloads/*
 /db
 cookies.txt
+tsconfig.tsbuildinfo
+*.tsbuildinfo
+youtube-cookies.txt

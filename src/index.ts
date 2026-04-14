@@ -69,19 +69,8 @@ const CLEANUP_MAX_AGE_MS = 60 * 60 * 1000; // 1 hour
 // Option 3: COOKIES_CONTENT=<full contents of cookies.txt>  (for Railway/cloud deployments)
 const COOKIES_FROM_BROWSER = process.env.COOKIES_FROM_BROWSER || '';
 
-// If COOKIES_CONTENT env var is set (cloud deployment), write it to a temp file once at startup
-let COOKIES_FILE = '';
-const _rawCookiesFile = process.env.COOKIES_FILE || '';
-if (process.env.COOKIES_CONTENT) {
-    const tmpCookiesPath = path.join('/tmp', 'cookies.txt');
-    fs.writeFileSync(tmpCookiesPath, process.env.COOKIES_CONTENT, 'utf8');
-    COOKIES_FILE = tmpCookiesPath;
-    console.log('Cookies loaded from COOKIES_CONTENT env var →', tmpCookiesPath);
-} else if (_rawCookiesFile) {
-    COOKIES_FILE = path.isAbsolute(_rawCookiesFile)
-        ? _rawCookiesFile
-        : path.resolve(process.cwd(), _rawCookiesFile);
-}
+// COOKIES_FILE is deprecated. Use getYtdlpCookieArgs() which handles all cookie formats properly.
+// All cookie handling is now done dynamically per-request in getYtdlpCookieArgs()
 
 function getYtdlpCookieArgs(platform?: string): string[] {
     let cookiesContent = '';
@@ -135,6 +124,9 @@ function getYouTubeExtraArgs(): string[] {
     return [
         '--geo-bypass',
         '--extractor-args', 'youtube:player_client=android,web',
+        '--no-check-certificate',
+        '--user-agent', 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
+        '--extractor-args', 'youtube:skip=dash',
     ];
 }
 
@@ -753,6 +745,7 @@ async function downloadImage(url: string, platform: string): Promise<DownloadRes
             '-o', outputTemplate,
             '--no-warnings',
             ...getYtdlpCookieArgs(),
+            ...(isYouTubeUrl(url) ? getYouTubeExtraArgs() : []),
         ], { timeout: YTDLP_TIMEOUT_MS, maxBuffer: YTDLP_MAX_BUFFER });
     } catch (dlError: any) {
         if (dlError?.killed) throw new Error('Download timed out');
@@ -780,7 +773,9 @@ async function downloadImage(url: string, platform: string): Promise<DownloadRes
     let thumbnail = '';
     try {
         const { stdout } = await execFileAsync('yt-dlp', [
-            url, '--dump-json', '--no-warnings', ...getYtdlpCookieArgs(platform),
+            url, '--dump-json', '--no-warnings',
+            ...getYtdlpCookieArgs(platform.toLowerCase()),
+            ...(isYouTubeUrl(url) ? getYouTubeExtraArgs() : []),
         ], { timeout: YTDLP_TIMEOUT_MS, maxBuffer: YTDLP_MAX_BUFFER });
         const info = JSON.parse(stdout);
         title = info.title || title;
@@ -825,8 +820,8 @@ async function downloadMedia(
         try {
             const { stdout: infoJson } = await execFileAsync('yt-dlp', [
                 cleanUrl, '--dump-json', '--no-warnings',
-                ...(isYouTubeUrl(cleanUrl) ? getYouTubeExtraArgs() : []),
                 ...getYtdlpCookieArgs(platform.toLowerCase()),
+                ...(isYouTubeUrl(cleanUrl) ? getYouTubeExtraArgs() : []),
             ], { timeout: YTDLP_TIMEOUT_MS, maxBuffer: YTDLP_MAX_BUFFER });
             videoInfo = JSON.parse(infoJson);
             console.log(`${platform} info retrieved successfully`);
@@ -856,8 +851,8 @@ async function downloadMedia(
             '--no-warnings',
             '--progress',
             '--newline',
-            ...(isYouTubeUrl(cleanUrl) ? getYouTubeExtraArgs() : []),
             ...getYtdlpCookieArgs(platform.toLowerCase()),
+            ...(isYouTubeUrl(cleanUrl) ? getYouTubeExtraArgs() : []),
         ];
 
         // For video with adaptive formats (video+audio merge), ensure mp4 output
@@ -1178,8 +1173,8 @@ const infoHandler = async (request: FastifyRequest<{ Querystring: { url: string 
         try {
             const { stdout: infoJson } = await execFileAsync('yt-dlp', [
                 cleanUrl, '--dump-json', '--no-warnings',
-                ...(isYT ? getYouTubeExtraArgs() : []),
                 ...getYtdlpCookieArgs(platformName.toLowerCase()),
+                ...(isYT ? getYouTubeExtraArgs() : []),
             ], { timeout: YTDLP_TIMEOUT_MS, maxBuffer: YTDLP_MAX_BUFFER });
             videoInfo = JSON.parse(infoJson);
         } catch (infoError: any) {
@@ -1427,8 +1422,8 @@ app.post('/api/channel-posts', {
                 // It's a video URL — extract channel_url with lightweight --print
                 const { stdout: channelUrl } = await execFileAsync('yt-dlp', [
                     normalizedUrl, '--print', 'channel_url', '--no-warnings', '--no-download', '--playlist-items', '1',
-                    ...getYouTubeExtraArgs(),
                     ...getYtdlpCookieArgs(),
+                    ...getYouTubeExtraArgs(),
                 ], { timeout: YTDLP_TIMEOUT_MS, maxBuffer: 1024 * 1024 });
 
                 creatorUrl = channelUrl.trim();
@@ -1452,8 +1447,8 @@ app.post('/api/channel-posts', {
             '--dump-json',
             '--no-warnings',
             '--playlist-items', `${startItem}:${fetchEnd}`,
-            ...getYouTubeExtraArgs(),
             ...getYtdlpCookieArgs(),
+            ...getYouTubeExtraArgs(),
         ];
 
         let stdout: string;
@@ -1589,8 +1584,8 @@ app.get('/health/detailed', { config: { rateLimit: { max: 5, timeWindow: '1 minu
                     '--no-warnings',
                     '--skip-download',
                     '-f', 'bestvideo',
-                    ...(platform === 'youtube' ? getYouTubeExtraArgs() : []),
                     ...getYtdlpCookieArgs(platform),
+                    ...(platform === 'youtube' ? getYouTubeExtraArgs() : []),
                 ], { timeout: 10000, maxBuffer: 10 * 1024 * 1024 });
 
                 const info = JSON.parse(stdout);
