@@ -102,7 +102,7 @@ const BASE_HEADERS: Record<string, string> = {
     'Sec-Fetch-Site': 'same-site',
 };
 
-async function igFetch(url: string, cookieHeader?: string, retries = 3): Promise<Response> {
+async function igFetch(url: string, cookieHeader?: string, retries = 20): Promise<Response> {
     const now = Date.now();
     const elapsed = now - lastRequestTime;
     if (elapsed < MIN_REQUEST_GAP) {
