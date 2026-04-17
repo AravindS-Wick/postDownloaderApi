@@ -64,8 +64,10 @@ function loadInstagramCookiesFromFile(cookiesFile: string): string {
 }
 
 const COOKIES_FILE = (() => {
-    // COOKIES_CONTENT env var (cloud): index.ts writes it to /tmp/cookies.txt at startup
-    if (process.env.COOKIES_CONTENT) return '/tmp/cookies.txt';
+    // Platform-specific cookies take priority (written by getYtdlpCookieArgs in index.ts)
+    if (process.env.INSTAGRAM_COOKIES) return '/tmp/cookies-instagram.txt';
+    // Generic COOKIES_CONTENT fallback
+    if (process.env.COOKIES_CONTENT) return '/tmp/cookies-generic.txt';
     const raw = process.env.COOKIES_FILE || '';
     if (!raw) return '';
     return path.isAbsolute(raw) ? raw : path.resolve(process.cwd(), raw);
@@ -100,7 +102,7 @@ const BASE_HEADERS: Record<string, string> = {
     'Sec-Fetch-Site': 'same-site',
 };
 
-async function igFetch(url: string, cookieHeader?: string, retries = 3): Promise<Response> {
+async function igFetch(url: string, cookieHeader?: string, retries = 20): Promise<Response> {
     const now = Date.now();
     const elapsed = now - lastRequestTime;
     if (elapsed < MIN_REQUEST_GAP) {
