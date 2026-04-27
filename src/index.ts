@@ -93,7 +93,10 @@ function getYtdlpCookieArgs(platform?: string): string[] {
     if (cookiesContent) {
         try {
             // Replace escaped newlines with actual newlines (Railway sends \n as literal string)
-            const normalizedContent = cookiesContent.replace(/\\n/g, '\n');
+            let normalizedContent = cookiesContent.replace(/\\n/g, '\n');
+            if (!normalizedContent.trimStart().startsWith('# Netscape HTTP Cookie File')) {
+                normalizedContent = '# Netscape HTTP Cookie File\n' + normalizedContent;
+            }
             const tmpPath = `/tmp/cookies-${platform || 'generic'}.txt`;
             fs.writeFileSync(tmpPath, normalizedContent);
             return ['--cookies', tmpPath];

@@ -8,7 +8,7 @@ nixPkgs = ["nodejs_22", "ffmpeg", "python312", "curl"]
 cmds = [
   "npm install",
   "npm rebuild better-sqlite3",
-  "curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp && chmod a+rx /usr/local/bin/yt-dlp",
+  "curl -L https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp && chmod a+rx /usr/local/bin/yt-dlp",
   "npm run build"
 ]
 
