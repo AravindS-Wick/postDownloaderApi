@@ -1,6 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { AuthService } from '../services/auth.service.js';
 import type { FastifyInstance } from 'fastify';
+import bcrypt from 'bcryptjs';
+import { getUser } from '../db/database.js';
 
 // Prevent better-sqlite3 native module from loading
 vi.mock('../db/database.js', () => ({
@@ -20,16 +22,18 @@ vi.mock('../db/database.js', () => ({
 }));
 
 vi.mock('../services/platform.service.js', () => ({
-    PlatformService: vi.fn().mockImplementation(() => ({
-        getInstagramAuthUrl: vi.fn().mockResolvedValue('https://instagram.com/auth'),
-        getYouTubeAuthUrl: vi.fn().mockResolvedValue('https://youtube.com/auth'),
-        getTwitterAuthUrl: vi.fn().mockResolvedValue('https://twitter.com/auth'),
-        getTikTokAuthUrl: vi.fn().mockResolvedValue('https://tiktok.com/auth'),
-        handleInstagramCallback: vi.fn().mockResolvedValue({ accessToken: 'ig-token', expiresIn: 3600 }),
-        handleYouTubeCallback: vi.fn().mockResolvedValue({ accessToken: 'yt-token', refreshToken: 'yt-refresh', expiresIn: 3600 }),
-        handleTwitterCallback: vi.fn().mockResolvedValue({ accessToken: 'tw-token', refreshToken: 'tw-refresh', expiresIn: 7200 }),
-        handleTikTokCallback: vi.fn().mockResolvedValue({ accessToken: 'tk-token', refreshToken: 'tk-refresh', expiresIn: 3600 }),
-    })),
+    PlatformService: vi.fn().mockImplementation(function () {
+        return {
+            getInstagramAuthUrl: vi.fn().mockResolvedValue('https://instagram.com/auth'),
+            getYouTubeAuthUrl: vi.fn().mockResolvedValue('https://youtube.com/auth'),
+            getTwitterAuthUrl: vi.fn().mockResolvedValue('https://twitter.com/auth'),
+            getTikTokAuthUrl: vi.fn().mockResolvedValue('https://tiktok.com/auth'),
+            handleInstagramCallback: vi.fn().mockResolvedValue({ accessToken: 'ig-token', expiresIn: 3600 }),
+            handleYouTubeCallback: vi.fn().mockResolvedValue({ accessToken: 'yt-token', refreshToken: 'yt-refresh', expiresIn: 3600 }),
+            handleTwitterCallback: vi.fn().mockResolvedValue({ accessToken: 'tw-token', refreshToken: 'tw-refresh', expiresIn: 7200 }),
+            handleTikTokCallback: vi.fn().mockResolvedValue({ accessToken: 'tk-token', refreshToken: 'tk-refresh', expiresIn: 3600 }),
+        };
+    }),
     isValidPlatform: vi.fn(),
     validateOAuthState: vi.fn(),
 }));
@@ -48,8 +52,6 @@ vi.mock('../config/auth.config.js', () => ({
     }
 }));
 
-import bcrypt from 'bcryptjs';
-import { getUser } from '../db/database.js';
 
 const mockFastify = {
     jwt: { sign: vi.fn().mockReturnValue('mock-jwt-token') }
@@ -65,14 +67,14 @@ describe('AuthService', () => {
 
     describe('login', () => {
         it('throws when user does not exist', async () => {
-            vi.mocked(getUser).mockReturnValue(undefined);
+            vi.mocked(getUser).mockResolvedValue(undefined);
             await expect(service.login('noone@test.com', 'pass')).rejects.toThrow('Invalid credentials');
         });
 
         it('throws when password is wrong', async () => {
             const hash = await bcrypt.hash('correct', 10);
-            vi.mocked(getUser).mockReturnValue({
-                email: 'u@test.com', password: hash, created_at: 0,
+            vi.mocked(getUser).mockResolvedValue({
+                email: 'u@test.com', user_ref: 'ref-1', password: hash, created_at: 0,
                 role: 'user', is_blocked: 0, monthly_downloads: 0, month_reset_at: 0, is_verified: 1, verification_code: null, verification_expires: null
             });
             await expect(service.login('u@test.com', 'wrong')).rejects.toThrow('Invalid credentials');
@@ -80,8 +82,8 @@ describe('AuthService', () => {
 
         it('throws when account is blocked', async () => {
             const hash = await bcrypt.hash('Password1', 10);
-            vi.mocked(getUser).mockReturnValue({
-                email: 'u@test.com', password: hash, created_at: 0,
+            vi.mocked(getUser).mockResolvedValue({
+                email: 'u@test.com', user_ref: 'ref-1', password: hash, created_at: 0,
                 role: 'user', is_blocked: 1, monthly_downloads: 0, month_reset_at: 0, is_verified: 1, verification_code: null, verification_expires: null
             });
             await expect(service.login('u@test.com', 'Password1')).rejects.toThrow('blocked');
@@ -89,8 +91,8 @@ describe('AuthService', () => {
 
         it('returns token and user profile on success', async () => {
             const hash = await bcrypt.hash('Password1', 10);
-            vi.mocked(getUser).mockReturnValue({
-                email: 'u@test.com', password: hash, created_at: 0,
+            vi.mocked(getUser).mockResolvedValue({
+                email: 'u@test.com', user_ref: 'ref-1', password: hash, created_at: 0,
                 role: 'user', is_blocked: 0, monthly_downloads: 0, month_reset_at: 0, is_verified: 1, verification_code: null, verification_expires: null
             });
             const result = await service.login('u@test.com', 'Password1');
@@ -143,8 +145,8 @@ describe('AuthService', () => {
 
     describe('getCurrentUser', () => {
         it('returns user profile when found', async () => {
-            vi.mocked(getUser).mockReturnValue({
-                email: 'u@test.com', password: 'hash', created_at: 0,
+            vi.mocked(getUser).mockResolvedValue({
+                email: 'u@test.com', user_ref: 'ref-1', password: 'hash', created_at: 0,
                 role: 'user', is_blocked: 0, monthly_downloads: 0, month_reset_at: 0, is_verified: 1, verification_code: null, verification_expires: null
             });
             const user = await service.getCurrentUser('u@test.com');
@@ -152,7 +154,7 @@ describe('AuthService', () => {
         });
 
         it('throws when user not found', async () => {
-            vi.mocked(getUser).mockReturnValue(undefined);
+            vi.mocked(getUser).mockResolvedValue(undefined);
             await expect(service.getCurrentUser('ghost@test.com')).rejects.toThrow('User not found');
         });
     });
