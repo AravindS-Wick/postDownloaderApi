@@ -89,13 +89,17 @@ function getYtdlpCookieArgs(platform?: string): string[] {
         cookiesContent = process.env.COOKIES_CONTENT;
     }
 
-    // Write to temp file if we have content
+    // Write to a platform-specific temp file to avoid concurrent overwrites
     if (cookiesContent) {
         try {
             // Replace escaped newlines with actual newlines (Railway sends \n as literal string)
-            const normalizedContent = cookiesContent.replace(/\\n/g, '\n');
-            fs.writeFileSync('/tmp/cookies.txt', normalizedContent);
-            return ['--cookies', '/tmp/cookies.txt'];
+            let normalizedContent = cookiesContent.replace(/\\n/g, '\n');
+            if (!normalizedContent.trimStart().startsWith('# Netscape HTTP Cookie File')) {
+                normalizedContent = '# Netscape HTTP Cookie File\n' + normalizedContent;
+            }
+            const tmpPath = `/tmp/cookies-${platform || 'generic'}.txt`;
+            fs.writeFileSync(tmpPath, normalizedContent);
+            return ['--cookies', tmpPath];
         } catch (err) {
             console.error('Failed to write cookies file:', err);
         }
@@ -1552,7 +1556,8 @@ app.get('/health/detailed', { config: { rateLimit: { max: 5, timeWindow: '1 minu
         };
 
         // Check cookies
-        if (process.env.COOKIES_CONTENT) {
+        const hasPlatformCookies = process.env.YOUTUBE_COOKIES || process.env.INSTAGRAM_COOKIES || process.env.TWITTER_COOKIES;
+        if (process.env.COOKIES_CONTENT || hasPlatformCookies) {
             results.services.cookies = 'configured';
         } else if (process.env.COOKIES_FILE) {
             results.services.cookies = 'configured (file path)';
@@ -1699,8 +1704,29 @@ async function bootstrapRoles() {
     }
 }
 
+// Write cookies files to /tmp at startup so platform services can read them immediately.
+// Each platform gets its own file to avoid concurrent request overwrites.
+function writeCookiesAtStartup(): void {
+    const entries: Array<[string, string]> = [
+        ['youtube',   process.env.YOUTUBE_COOKIES   || ''],
+        ['instagram', process.env.INSTAGRAM_COOKIES || ''],
+        ['twitter',   process.env.TWITTER_COOKIES   || ''],
+        ['generic',   process.env.COOKIES_CONTENT   || ''],
+    ];
+    for (const [name, content] of entries) {
+        if (!content) continue;
+        try {
+            fs.writeFileSync(`/tmp/cookies-${name}.txt`, content.replace(/\\n/g, '\n'));
+        } catch (err) {
+            console.error(`[cookies] Failed to write /tmp/cookies-${name}.txt:`, err);
+        }
+    }
+}
+
 const start = async () => {
     try {
+        writeCookiesAtStartup();
+
         // Wait for DB adapter to connect and seed users before accepting requests
         await dbReady;
 
